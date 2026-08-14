@@ -1,0 +1,51 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+build/
+
+# Runtime / company data
+data/
+backup/
+backups/
+uploads/
+
+# MongoDB
+mongodb-data/
+mongo-data/
+
+# Logs
+*.log
+logs/
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# IDE / Windows
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local / Emergent çalışma dosyaları
+.emergent/
+memory/
+migration/
+test_reports/
+test_result.md
+design_guidelines.json
+deploy/
+.gitconfig

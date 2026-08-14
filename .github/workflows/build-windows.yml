@@ -1,0 +1,60 @@
+name: build-windows-installer
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with: { node-version: "20" }
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Backend — PyInstaller
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          pyinstaller --onefile --name merkoteks_backend --add-data "templates;templates" server.py
+
+      - name: Frontend — build
+        working-directory: frontend
+        env:
+          REACT_APP_BACKEND_URL: "http://__BACKEND_HOST__:8080"
+        run: |
+          npm i -g yarn
+          yarn install --frozen-lockfile
+          yarn build
+
+      - name: Electron — package
+        working-directory: deploy/windows/electron
+        run: |
+          yarn install --frozen-lockfile
+          yarn make
+
+      - name: Fetch nssm & MongoDB installer
+        run: |
+          Invoke-WebRequest -Uri https://nssm.cc/release/nssm-2.24.zip -OutFile nssm.zip
+          Expand-Archive nssm.zip -DestinationPath nssm
+          Copy-Item nssm/nssm-2.24/win64/nssm.exe deploy/windows/assets/nssm.exe -Force
+          Invoke-WebRequest -Uri "https://fastdl.mongodb.org/windows/mongodb-windows-x86_64-7.0.14-signed.msi" -OutFile deploy/windows/assets/mongodb-installer.msi
+
+      - name: Inno Setup — compile
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" deploy\windows\installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MerkoteksPersonelIzinKurulum
+          path: deploy/windows/Output/MerkoteksPersonelIzinKurulum.exe

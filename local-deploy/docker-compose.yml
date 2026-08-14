@@ -1,0 +1,117 @@
+version: "3.9"
+
+# =============================================================================
+# Merkoteks Personel & İzin Sistemi — On-Premise LAN Deployment
+# =============================================================================
+# Windows host'ta çalışır. Client bilgisayarlar http://SERVER_IP üzerinden erişir.
+#
+# İç ağ (Docker network):    mongodb + backend      (LAN'a KAPALI)
+# Dış ağ (yalnız 80 portu):  nginx reverse proxy    (LAN'a AÇIK)
+#
+# Volume kalıcılığı:
+#   mongodb-data  →  ${DATA_DIR}/mongodb    (host bind mount)
+#   uploads-data  →  ${DATA_DIR}/uploads    (host bind mount)
+# =============================================================================
+
+networks:
+  merkoteks-internal:
+    driver: bridge
+
+volumes:
+  mongodb-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_DIR}/mongodb
+  uploads-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_DIR}/uploads
+
+services:
+  # --------------------------------------------------------------------------
+  # MongoDB 7 — sadece internal network, port EXPOSE EDİLMİYOR
+  # --------------------------------------------------------------------------
+  mongodb:
+    image: mongo:7.0
+    container_name: merkoteks-mongodb
+    restart: unless-stopped
+    command: ["mongod", "--bind_ip_all"]
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - merkoteks-internal
+    # NO ports exposed - only accessible via internal network
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand({ping:1}).ok"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # Backend — FastAPI + LibreOffice headless (PDF)
+  # --------------------------------------------------------------------------
+  backend:
+    build:
+      context: ..
+      dockerfile: local-deploy/backend/Dockerfile
+    container_name: merkoteks-backend
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      MONGO_URL: "mongodb://mongodb:27017"
+      DB_NAME: "${DB_NAME:-merkoteks_hr}"
+      JWT_SECRET: "${JWT_SECRET}"
+      ADMIN_EMAIL: "${ADMIN_EMAIL}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
+      ADMIN_NAME: "${ADMIN_NAME:-Yönetici}"
+      EMAIL_FROM_NAME: "${EMAIL_FROM_NAME:-Merkoteks Personel Sistemi}"
+      WEBHOOK_CRON_SECRET: "${WEBHOOK_CRON_SECRET:-not-used-in-local}"
+      CORS_ORIGINS: "${CORS_ORIGINS:-*}"
+      # LOCAL storage mode — Emergent Object Storage yerine yerel disk
+      STORAGE_MODE: "local"
+      UPLOAD_PATH: "/data/uploads"
+      # Emergent-only key'ler local için gerekmiyor
+      EMERGENT_LLM_KEY: ""
+      EMERGENT_EMAIL_KEY: ""
+    volumes:
+      - uploads-data:/data/uploads
+    networks:
+      - merkoteks-internal
+    # NO ports exposed to LAN - only accessible via nginx proxy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8001/api/health',timeout=3).status==200 else 1)"]
+      interval: 20s
+      timeout: 6s
+      retries: 5
+      start_period: 45s
+
+  # --------------------------------------------------------------------------
+  # Nginx reverse proxy — TEK LAN GİRİŞ NOKTASI (port 80)
+  # Frontend static + /api → backend
+  # --------------------------------------------------------------------------
+  nginx:
+    build:
+      context: ..
+      dockerfile: local-deploy/frontend/Dockerfile
+    container_name: merkoteks-nginx
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "80:80"
+    networks:
+      - merkoteks-internal
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 15s
