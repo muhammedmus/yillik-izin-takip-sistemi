@@ -6,7 +6,7 @@ import {
   Settings as SettingsIcon,
   LogOut,
   Building2,
-  HeartPulse
+  HeartPulse,
 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { Button } from "@/components/ui/button";
@@ -14,7 +14,7 @@ import { Button } from "@/components/ui/button";
 const roleLabel = {
   admin: "Yönetici",
   hr: "İnsan Kaynakları",
-  viewer: "Rapor Kullanıcısı"
+  viewer: "Rapor Kullanıcısı",
 };
 
 export default function Layout() {
@@ -26,31 +26,31 @@ export default function Layout() {
       to: "/personel",
       icon: Users,
       label: "Personel",
-      roles: ["admin", "hr", "viewer"]
+      roles: ["admin", "hr", "viewer"],
     },
     {
       to: "/izinler",
       icon: CalendarDays,
       label: "İzinler",
-      roles: ["admin", "hr", "viewer"]
+      roles: ["admin", "hr", "viewer"],
     },
     {
       to: "/raporlar",
       icon: FileBarChart,
       label: "Raporlar",
-      roles: ["admin", "hr", "viewer"]
+      roles: ["admin", "hr", "viewer"],
     },
     {
       to: "/ozel-izinler",
       icon: HeartPulse,
       label: "Özel İzinler",
-      roles: ["admin", "hr"]
+      roles: ["admin", "hr"],
     },
     {
       to: "/ayarlar",
       icon: SettingsIcon,
       label: "Ayarlar",
-      roles: ["admin", "hr"]
+      roles: ["admin", "hr"],
     },
   ];
 
@@ -66,23 +66,24 @@ export default function Layout() {
         data-testid="sidebar"
       >
         <div className="px-5 py-6 border-b border-slate-800 shrink-0">
-          <div className="flex items-center gap-2">
-            <div className="w-9 h-9 rounded-md bg-blue-600 grid place-items-center shrink-0">
-              <Building2 size={20} />
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-md bg-blue-600 grid place-items-center shrink-0">
+              <Building2 size={21} />
             </div>
 
             <div className="min-w-0">
-              <div className="text-sm font-semibold tracking-tight leading-tight">
+              <div className="text-[15px] font-semibold tracking-tight leading-tight">
                 Personel İzin
               </div>
-              <div className="text-sm font-semibold tracking-tight leading-tight">
+
+              <div className="text-[15px] font-semibold tracking-tight leading-tight">
                 Takip Sistemi
               </div>
             </div>
           </div>
         </div>
 
-        <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
+        <nav className="flex-1 p-3 space-y-1.5 overflow-y-auto">
           {items
             .filter((i) => i.roles.includes(user?.role))
             .map(({ to, icon: Icon, label }) => (
@@ -93,14 +94,14 @@ export default function Layout() {
                   .toLowerCase()
                   .replace(/\s+/g, "-")}`}
                 className={({ isActive }) =>
-                  `flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors ${
+                  `flex items-center gap-3 px-3 py-2.5 rounded-md text-base font-medium transition-colors ${
                     isActive
                       ? "bg-blue-600 text-white"
                       : "text-slate-300 hover:bg-slate-800 hover:text-white"
                   }`
                 }
               >
-                <Icon size={17} />
+                <Icon size={18} />
                 <span>{label}</span>
               </NavLink>
             ))}
