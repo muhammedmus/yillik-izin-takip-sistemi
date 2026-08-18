@@ -32,7 +32,7 @@ const STATUS_LABEL = {
 
 export default function Holidays() {
   const { user } = useAuth();
-  const isAdmin = user?.role === "admin";
+  const canManage = user?.role === "admin" || user?.role === "hr";
   const currentYear = new Date().getFullYear();
   const [year, setYear] = useState(String(currentYear));
   const [availableYears, setAvailableYears] = useState([]);
@@ -170,7 +170,7 @@ export default function Holidays() {
         </TabsContent>
 
         <TabsContent value="review" className="mt-3">
-          <ReviewTab records={reviewRecords} isAdmin={isAdmin} onRefresh={load} year={year} setYear={setYear} availableYears={availableYears} currentYear={currentYear} />
+          <ReviewTab records={reviewRecords} canManage={canManage} onRefresh={load} year={year} setYear={setYear} availableYears={availableYears} currentYear={currentYear} />
         </TabsContent>
       </Tabs>
 
@@ -392,7 +392,7 @@ function StatBox({ label, value, color, onClick, active }) {
 // ============================================================================
 // Review Tab — Kontrol Gerekli
 // ============================================================================
-function ReviewTab({ records, isAdmin, onRefresh, year, setYear, availableYears, currentYear }) {
+function ReviewTab({ records, canManage, onRefresh, year, setYear, availableYears, currentYear }) {
   const [selected, setSelected] = useState(new Set());
   const [editMap, setEditMap] = useState({}); // {id: newName}
   const [bulkName, setBulkName] = useState("");
@@ -492,7 +492,7 @@ function ReviewTab({ records, isAdmin, onRefresh, year, setYear, availableYears,
             <Button size="sm" variant="outline" onClick={() => doBulkActive(false)} disabled={bulkBusy || !selected.size} data-testid="review-bulk-deactivate">
               Pasif Yap
             </Button>
-            {isAdmin && (
+            {canManage && (
               <Button size="sm" variant="destructive" onClick={() => setDeleteOpen(true)} disabled={bulkBusy || !selected.size} data-testid="review-bulk-delete">
                 <Trash2 size={13} className="mr-1" /> Sil
               </Button>
