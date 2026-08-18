@@ -1258,14 +1258,29 @@ async def _consent_items(pilot: bool = False) -> list:
         annual = [L for L in leaves if _is_annual_type(L.get("izin_turu"))]
         annual.sort(key=lambda x: x.get("start_date") or "")
         cum_used = 0.0
+        current_year = date.today().year
         for L in annual:
             sd = L.get("start_date") or ""
             days = float(L.get("days") or 0)
             entitled_so_far = sum(float(e.get("days") or 0) for e in ents if e.get("date", "") <= sd)
             over = (cum_used + days) - entitled_so_far
             zero_day_no_balance = (days == 0) and ((entitled_so_far - cum_used) <= 0)
-            advance_days = round(min(days, max(0.0, over)), 2)
-            if (over > 0) or zero_day_no_balance:
+
+            # Muvafakatname sadece mevcut takvim yilindaki izinler icin istenir.
+            # Eski izinler kullanilan izin / bakiye hesabinda kalmaya devam eder.
+            try:
+                leave_year = date.fromisoformat(sd[:10]).year
+            except Exception:
+                leave_year = None
+            is_current_year_leave = leave_year == current_year
+
+            advance_days = (
+                round(min(days, max(0.0, over)), 2)
+                if is_current_year_leave
+                else 0
+            )
+
+            if is_current_year_leave and ((over > 0) or zero_day_no_balance):
                 # Bir sonraki hak ediş tarihi (izinden sonra)
                 next_ent = next((e.get("date") for e in ents if e.get("date", "") > sd), None)
                 items.append({
@@ -3654,9 +3669,27 @@ async def list_leaves(personnel_id: Optional[str] = None,
             # olur (yer-tutucu kayıt senaryosu). Bakiye pozitif ise 0 günlük izin muvafakatname
             # gerektirmez.
             zero_day_no_balance = (L["days"] == 0) and ((entitled_so_far - prior_used) <= 0)
-            L["consent_required"] = (over > 0) or zero_day_no_balance
-            # Iter 39: bu izne düşen avans (muvafakatname gerektiren) gün sayısı
-            L["consent_advance_days"] = round(min(float(L["days"]), max(0.0, over)), 2)
+
+            # Muvafakatname uyarisi sadece mevcut takvim yilindaki izinlerde gosterilir.
+            # Eski izinler bakiye ve kullanilan izin hesabinda kalmaya devam eder.
+            try:
+                leave_year = date.fromisoformat((L.get("start_date") or "")[:10]).year
+            except Exception:
+                leave_year = None
+            is_current_year_leave = leave_year == date.today().year
+
+            L["consent_required"] = (
+                is_current_year_leave
+                and ((over > 0) or zero_day_no_balance)
+            )
+
+            # Eski yillardaki izinler icin muvafakatname/avans gunu gosterme.
+            L["consent_advance_days"] = (
+                round(min(float(L["days"]), max(0.0, over)), 2)
+                if is_current_year_leave
+                else 0
+            )
+
             cum_used[pid] = prior_used + L["days"]
     return items
 

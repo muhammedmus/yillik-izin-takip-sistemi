@@ -144,7 +144,31 @@ export default function PersonnelDetail() {
 
   if (!data) return <div className="text-slate-500 text-sm">Yükleniyor...</div>;
   const p = data.personnel; const bal = data.balance;
-  const low = bal.entitled_total > 0 && bal.remaining < 10;
+
+  // Düşük bakiye uyarısı yalnızca personel mevcut takvim yılında
+  // 10 günden az yıllık izin kullanmışsa gösterilir.
+  const currentYear = new Date().getFullYear();
+  const currentYearAnnualUsed = leaves.reduce((sum, L) => {
+    const startDate = String(L.start_date || "");
+    const leaveYear = Number(startDate.slice(0, 4));
+    const leaveType = String(L.izin_turu || "").toLocaleLowerCase("tr-TR");
+
+    const isAnnualLeave =
+      leaveType.includes("yıllık") ||
+      leaveType.includes("yillik") ||
+      leaveType === "annual";
+
+    if (leaveYear === currentYear && isAnnualLeave) {
+      return sum + Number(L.days || 0);
+    }
+
+    return sum;
+  }, 0);
+
+  const low =
+    bal.entitled_total > 0 &&
+    bal.remaining < 10 &&
+    currentYearAnnualUsed < 10;
   // Iter 56: SADECE bugün eklenen (created_at BUGÜN) en son avans izin için uyarı.
   // Böylece eski avans izinler için sürekli uyarı çıkmaz — yalnız o gün girilen izne özel.
   const _todayIso = new Date().toISOString().slice(0, 10);
