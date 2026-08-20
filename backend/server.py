@@ -211,6 +211,70 @@ def require_roles(*roles: str):
         return user
     return dep
 
+
+def _allowed_companies(user: dict) -> Optional[List[str]]:
+    """Admin için None=tüm şirketler. Diğer roller için yalnız atanmış şirketler."""
+    if (user or {}).get("role") == "admin":
+        return None
+    vals = (user or {}).get("allowed_companies") or []
+    return sorted({str(x).strip() for x in vals if str(x).strip()})
+
+
+def _company_scope_filter(user: dict) -> dict:
+    allowed = _allowed_companies(user)
+    if allowed is None:
+        return {}
+    if not allowed:
+        return {"sirket": "__NO_COMPANY_ACCESS__"}
+    return {"sirket": {"$in": allowed}}
+
+
+def _merge_company_scope(filt: Optional[dict], user: dict) -> dict:
+    base = dict(filt or {})
+    scope = _company_scope_filter(user)
+    if not scope:
+        return base
+    if "sirket" in base:
+        return {"$and": [base, scope]}
+    base.update(scope)
+    return base
+
+
+async def _ensure_personnel_company_access(pid: str, user: dict) -> dict:
+    p = await db.personnel.find_one({"id": pid}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Personel bulunamadı")
+    allowed = _allowed_companies(user)
+    if allowed is not None and p.get("sirket") not in allowed:
+        raise HTTPException(status_code=403, detail="Bu personelin şirketini görüntüleme yetkiniz yok")
+    return p
+
+
+async def _apply_leave_company_scope(filt: Optional[dict], user: dict) -> Optional[dict]:
+    if filt is None:
+        return None
+    allowed = _allowed_companies(user)
+    if allowed is None:
+        return filt
+    if not allowed:
+        return None
+    pids = await db.personnel.distinct("id", {"sirket": {"$in": allowed}})
+    if not pids:
+        return None
+    out = dict(filt)
+    existing = out.get("personnel_id")
+    pset = set(pids)
+    if isinstance(existing, str):
+        return out if existing in pset else None
+    if isinstance(existing, dict) and "$in" in existing:
+        inter = [x for x in existing.get("$in", []) if x in pset]
+        if not inter:
+            return None
+        out["personnel_id"] = {"$in": inter}
+    else:
+        out["personnel_id"] = {"$in": pids}
+    return out
+
 # -----------------------------------------------------------------------------
 # Turkish holidays (static 2024-2027 including religious days) — Arife = half day
 # -----------------------------------------------------------------------------
@@ -1065,9 +1129,7 @@ async def create_special_leave(body: SpecialLeaveIn, request: Request,
         )
     if body.tur not in SPECIAL_LEAVE_TYPES:
         raise HTTPException(status_code=400, detail=f"Geçersiz tür")
-    p = await db.personnel.find_one({"id": body.personnel_id}, {"_id": 0})
-    if not p:
-        raise HTTPException(status_code=404, detail="Personel bulunamadı")
+    p = await _ensure_personnel_company_access(body.personnel_id, user)
     rec = body.model_dump()
     rec["id"] = str(uuid.uuid4())
     rec["created_at"] = datetime.now(timezone.utc).isoformat()
@@ -1658,6 +1720,7 @@ class UserExtendedIn(BaseModel):
     role: Role
     username: Optional[str] = ""
     departman: Optional[str] = ""
+    allowed_companies: List[str] = Field(default_factory=list)
     aktif: bool = True
     aciklama: Optional[str] = ""
 
@@ -1667,6 +1730,7 @@ class UserUpdateIn(BaseModel):
     username: Optional[str] = None
     role: Optional[Role] = None
     departman: Optional[str] = None
+    allowed_companies: Optional[List[str]] = None
     aktif: Optional[bool] = None
     aciklama: Optional[str] = None
 
@@ -1867,7 +1931,8 @@ async def login(body: LoginIn, request: Request, response: Response):
                  description="Başarılı giriş", request=request, user=user, success=True)
     return {
         "token": token,
-        "user": {"id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"]},
+        "user": {"id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"],
+                 "allowed_companies": user.get("allowed_companies", [])},
     }
 
 @api.post("/auth/logout")
@@ -1937,13 +2002,14 @@ async def create_user(body: UserExtendedIn, request: Request, current: dict = De
         "name": body.name,
         "role": body.role,
         "departman": body.departman or "",
+        "allowed_companies": [] if body.role == "admin" else sorted({x.strip() for x in body.allowed_companies if x and x.strip()}),
         "aktif": bool(body.aktif),
         "aciklama": body.aciklama or "",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.users.insert_one(doc)
     await _audit(action="create", module="users", entity_type="user", entity_id=doc["id"], entity_name=doc["name"],
-                 new_values={k: doc[k] for k in ("email","username","name","role","departman","aktif","aciklama")},
+                 new_values={k: doc[k] for k in ("email","username","name","role","departman","allowed_companies","aktif","aciklama")},
                  description=f"Yeni kullanıcı oluşturuldu: {doc['name']} ({doc['email']})",
                  request=request, user=current)
     return {k: v for k, v in doc.items() if k not in ("password_hash", "_id")}
@@ -1967,6 +2033,11 @@ async def update_user(user_id: str, body: UserUpdateIn, request: Request, curren
         raise HTTPException(status_code=400, detail="Kendi hesabınızı pasif yapamazsınız")
     if user_id == current["id"] and "role" in updates and updates["role"] != current["role"]:
         raise HTTPException(status_code=400, detail="Kendi rolünüzü değiştiremezsiniz")
+    effective_role = updates.get("role", existing.get("role"))
+    if effective_role == "admin":
+        updates["allowed_companies"] = []
+    elif "allowed_companies" in updates:
+        updates["allowed_companies"] = sorted({str(x).strip() for x in (updates.get("allowed_companies") or []) if str(x).strip()})
     if not updates:
         return existing
     await db.users.update_one({"id": user_id}, {"$set": updates})
@@ -2929,7 +3000,7 @@ def _ten_day_check_from_leaves(entitlements: list, next_ent_iso: Optional[str],
 
 
 @api.get("/personnel/balance-summary")
-async def personnel_balance_summary(aktif: Optional[bool] = None, _: dict = Depends(get_current_user)):
+async def personnel_balance_summary(aktif: Optional[bool] = None, current: dict = Depends(get_current_user)):
     """Tüm personelin (veya aktif filtresine göre) kalan izin özetini tek sorguda döner (N+1 önler).
     Iter 36: Her personel için `ten_day_check` alanı eklendi — mevcut hak ediş döneminde
     en az bir 10-gün kesintisiz yıllık izin kullanımı var mı kontrolü.
@@ -2937,6 +3008,7 @@ async def personnel_balance_summary(aktif: Optional[bool] = None, _: dict = Depe
     q: dict = {}
     if aktif is not None:
         q["aktif"] = aktif
+    q = _merge_company_scope(q, current)
     # Tüm izinleri tek seferde çek — personel bazlı grupla (N+1 önle)
     leaves_by_pid: dict = {}
     async for L in db.leaves.find({}, {"_id": 0, "personnel_id": 1, "start_date": 1,
@@ -3024,12 +3096,12 @@ async def list_personnel(
     sort_by: str = "ad_soyad", sort_dir: str = "asc",
     limit: Optional[int] = None, skip: int = 0,
     consent_advance: bool = False,
-    _: dict = Depends(get_current_user),
+    current: dict = Depends(get_current_user),
 ):
     """Personel listesi. Yeni: sort_by/sort_dir/limit/skip server-side. Tüm listeye ihtiyaç varsa limit=None.
     consent_advance=True → sadece ten_day_check.status='advance_ok' olan personeller (Sarı Rozet).
     """
-    filt = _build_personnel_filter(q, departman, sirket, aktif)
+    filt = _merge_company_scope(_build_personnel_filter(q, departman, sirket, aktif), current)
     if consent_advance:
         allow_ids = list(await _advance_ok_pids())
         filt = {**filt, "id": {"$in": allow_ids}} if allow_ids else {"id": "__none__"}
@@ -3051,8 +3123,8 @@ async def list_personnel(
 async def personnel_count(q: Optional[str] = None, departman: Optional[str] = None,
                            sirket: Optional[str] = None, aktif: Optional[bool] = None,
                            consent_advance: bool = False,
-                           _: dict = Depends(get_current_user)):
-    filt = _build_personnel_filter(q, departman, sirket, aktif)
+                           current: dict = Depends(get_current_user)):
+    filt = _merge_company_scope(_build_personnel_filter(q, departman, sirket, aktif), current)
     if consent_advance:
         allow_ids = list(await _advance_ok_pids())
         filt = {**filt, "id": {"$in": allow_ids}} if allow_ids else {"id": "__none__"}
@@ -3061,11 +3133,12 @@ async def personnel_count(q: Optional[str] = None, departman: Optional[str] = No
 
 @api.get("/personnel/facets")
 async def personnel_facets(include_inactive: bool = False,
-                            _: dict = Depends(get_current_user)):
+                            current: dict = Depends(get_current_user)):
     """Departman + şirket + görev listeleri.
     include_inactive=True ise pasif personelin değerleri de dahil edilir
     (otomatik tamamlama için tavsiye edilir — mevcut tüm departmanlar önerilsin)."""
     filt = {} if include_inactive else {"aktif": True}
+    filt = _merge_company_scope(filt, current)
     deps = await db.personnel.distinct("departman", filt)
     sirks = await db.personnel.distinct("sirket", filt)
     gorevs = await db.personnel.distinct("gorev", filt)
@@ -3076,6 +3149,9 @@ async def personnel_facets(include_inactive: bool = False,
 
 @api.post("/personnel")
 async def create_personnel(body: PersonnelIn, request: Request, current: dict = Depends(require_roles("admin", "hr"))):
+    allowed = _allowed_companies(current)
+    if allowed is not None and body.sirket not in allowed:
+        raise HTTPException(status_code=403, detail="Bu şirkete personel ekleme yetkiniz yok")
     normalized = _normalize_sicil(body.sicil_no)
     if not normalized:
         raise HTTPException(status_code=400, detail="Sicil numarası zorunlu")
@@ -3094,17 +3170,15 @@ async def create_personnel(body: PersonnelIn, request: Request, current: dict = 
     return {k: v for k, v in d.items() if k != "_id"}
 
 @api.get("/personnel/{pid}")
-async def get_personnel(pid: str, _: dict = Depends(get_current_user)):
-    p = await db.personnel.find_one({"id": pid}, {"_id": 0})
-    if not p:
-        raise HTTPException(status_code=404, detail="Personel bulunamadı")
-    return p
+async def get_personnel(pid: str, current: dict = Depends(get_current_user)):
+    return await _ensure_personnel_company_access(pid, current)
 
 @api.put("/personnel/{pid}")
 async def update_personnel(pid: str, body: PersonnelIn, request: Request, current: dict = Depends(require_roles("admin", "hr"))):
-    existing = await db.personnel.find_one({"id": pid}, {"_id": 0})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Personel bulunamadı")
+    existing = await _ensure_personnel_company_access(pid, current)
+    allowed = _allowed_companies(current)
+    if allowed is not None and body.sirket not in allowed:
+        raise HTTPException(status_code=403, detail="Personeli yetkiniz olmayan bir şirkete taşıyamazsınız")
     if_match = request.headers.get("If-Match")
     current_updated_at = existing.get("updated_at") or existing.get("created_at")
     if if_match and current_updated_at and if_match != current_updated_at:
@@ -3605,13 +3679,14 @@ async def list_leaves(personnel_id: Optional[str] = None,
                        limit: int = 100, skip: int = 0,
                        include_isbasi: bool = True,
                        include_consent: bool = False,
-                       _: dict = Depends(get_current_user)):
+                       current: dict = Depends(get_current_user)):
     """İzin listesi. Server-side filtre + sort + pagination.
     Iter 47: personnel_active True/False → aktif/işten ayrılan personel izinleri.
     """
     filt = await _build_leaves_filter(personnel_id, start, end, recent_days,
                                        izin_turu, q, departman, sirket,
                                        personnel_active=personnel_active)
+    filt = await _apply_leave_company_scope(filt, current)
     if filt is None:
         return []
     allowed_sort = {"start_date", "end_date", "days", "created_at", "izin_turu"}
@@ -3703,10 +3778,11 @@ async def leaves_count(personnel_id: Optional[str] = None,
                         departman: Optional[str] = None,
                         sirket: Optional[str] = None,
                         personnel_active: Optional[bool] = None,
-                        _: dict = Depends(get_current_user)):
+                        current: dict = Depends(get_current_user)):
     filt = await _build_leaves_filter(personnel_id, start, end, recent_days,
                                        izin_turu, q, departman, sirket,
                                        personnel_active=personnel_active)
+    filt = await _apply_leave_company_scope(filt, current)
     if filt is None:
         return {"total": 0}
     total = await db.leaves.count_documents(filt)
@@ -3733,9 +3809,9 @@ class BulkLeaveIn(BaseModel):
     izin_turu: str = "Yıllık İzin"
     aciklama: str = ""
 
-async def _resolve_bulk_targets(target: BulkTarget) -> List[dict]:
-    """Aktif personel filtresi hedef türüne göre uygulanır."""
-    q: dict = {"aktif": True}
+async def _resolve_bulk_targets(target: BulkTarget, user: dict) -> List[dict]:
+    """Aktif personel filtresi hedef türüne ve kullanıcının şirket yetkisine göre uygulanır."""
+    q: dict = _merge_company_scope({"aktif": True}, user)
     if target.type == "department":
         if not target.department:
             raise HTTPException(status_code=400, detail="Departman seçilmedi")
@@ -3804,11 +3880,11 @@ async def _bulk_preview_row(p: dict, s: date, e: date, izin_turu: str) -> dict:
     }
 
 @api.post("/leaves/bulk/preview")
-async def leaves_bulk_preview(body: BulkLeaveIn, _: dict = Depends(require_roles("admin", "hr"))):
+async def leaves_bulk_preview(body: BulkLeaveIn, user: dict = Depends(require_roles("admin", "hr"))):
     s = _parse_date(body.start_date); e = _parse_date(body.end_date)
     if not s or not e or e < s:
         raise HTTPException(status_code=400, detail="Geçersiz tarih aralığı")
-    people = await _resolve_bulk_targets(body.target)
+    people = await _resolve_bulk_targets(body.target, user)
     rows = []
     for p in people:
         rows.append(await _bulk_preview_row(p, s, e, body.izin_turu))
@@ -3820,7 +3896,7 @@ async def leaves_bulk_create(body: BulkLeaveIn, background_tasks: BackgroundTask
     s = _parse_date(body.start_date); e = _parse_date(body.end_date)
     if not s or not e or e < s:
         raise HTTPException(status_code=400, detail="Geçersiz tarih aralığı")
-    people = await _resolve_bulk_targets(body.target)
+    people = await _resolve_bulk_targets(body.target, user)
     created: List[dict] = []
     skipped: List[dict] = []
     for p in people:
@@ -4673,10 +4749,11 @@ async def update_leave(lid: str, body: LeaveIn, background_tasks: BackgroundTask
     return await _upsert_leave(body, background_tasks, user, exclude_id=lid, existing=existing, request=request)
 
 @api.get("/leaves/single/{lid}")
-async def get_leave(lid: str, _: dict = Depends(get_current_user)):
+async def get_leave(lid: str, current: dict = Depends(get_current_user)):
     L = await db.leaves.find_one({"id": lid}, {"_id": 0})
     if not L:
         raise HTTPException(status_code=404, detail="İzin kaydı bulunamadı")
+    await _ensure_personnel_company_access(L.get("personnel_id"), current)
     return L
 
 async def _upsert_leave(body: LeaveIn, background_tasks: BackgroundTasks, user: dict,
@@ -6411,10 +6488,11 @@ async def personnel_sync_report_xlsx(body: dict,
 # Charts data
 # -----------------------------------------------------------------------------
 @api.get("/reports/charts")
-async def charts_data(_: dict = Depends(get_current_user)):
+async def charts_data(current: dict = Depends(get_current_user)):
+    personnel_scope = _merge_company_scope({"aktif": True}, current)
     # Departman dağılımı
     dept_map = {}
-    async for p in db.personnel.find({"aktif": True}, {"_id": 0, "departman": 1}):
+    async for p in db.personnel.find(personnel_scope, {"_id": 0, "departman": 1}):
         d = p.get("departman") or "Belirsiz"
         dept_map[d] = dept_map.get(d, 0) + 1
     dept = [{"name": k, "value": v} for k, v in sorted(dept_map.items(), key=lambda x: -x[1])]
@@ -6429,7 +6507,9 @@ async def charts_data(_: dict = Depends(get_current_user)):
     trend_map = {f"{y:04d}-{m:02d}": 0.0 for y, m in months}
     trend_people: dict = {f"{y:04d}-{m:02d}": set() for y, m in months}
     first = f"{months[0][0]:04d}-{months[0][1]:02d}-01"
-    async for L in db.leaves.find({"start_date": {"$gte": first}}, {"_id": 0, "start_date": 1, "days": 1, "personnel_id": 1}):
+    allowed_pids = await db.personnel.distinct("id", personnel_scope)
+    leave_scope = {"start_date": {"$gte": first}, "personnel_id": {"$in": allowed_pids}}
+    async for L in db.leaves.find(leave_scope, {"_id": 0, "start_date": 1, "days": 1, "personnel_id": 1}):
         key = L["start_date"][:7]
         if key in trend_map:
             trend_map[key] += float(L.get("days", 0))
@@ -6442,14 +6522,14 @@ async def charts_data(_: dict = Depends(get_current_user)):
 
     # Şirket dağılımı
     comp_map = {}
-    async for p in db.personnel.find({"aktif": True}, {"_id": 0, "sirket": 1}):
+    async for p in db.personnel.find(personnel_scope, {"_id": 0, "sirket": 1}):
         s = p.get("sirket") or "Belirsiz"
         comp_map[s] = comp_map.get(s, 0) + 1
     company = [{"name": k, "value": v} for k, v in sorted(comp_map.items(), key=lambda x: -x[1])]
 
     # Kalan izin dağılımı (aktif personel)
     buckets = {"0-5": 0, "6-10": 0, "11-15": 0, "16-20": 0, "20+": 0}
-    async for p in db.personnel.find({"aktif": True}, {"_id": 0}):
+    async for p in db.personnel.find(personnel_scope, {"_id": 0}):
         b = await _balance_for(p)
         r = b["remaining"]
         if r <= 5: buckets["0-5"] += 1
@@ -6465,7 +6545,7 @@ async def charts_data(_: dict = Depends(get_current_user)):
 # Reports (Dashboard stats + exports)
 # -----------------------------------------------------------------------------
 @api.get("/dashboard/summary")
-async def dashboard_summary(_: dict = Depends(get_current_user)):
+async def dashboard_summary(current: dict = Depends(get_current_user)):
     """Panel özet kartları için tek endpoint. Alan sözleşmesi:
     - total_active_personnel: aktif personel sayısı
     - today_on_leave: bugün izinli benzersiz aktif personel sayısı
@@ -6478,7 +6558,8 @@ async def dashboard_summary(_: dict = Depends(get_current_user)):
     # Aktif personel + id set (izin taramasında filtreleme için)
     active_ids: set = set()
     total_active = 0
-    async for p in db.personnel.find({"aktif": True}, {"_id": 0, "id": 1}):
+    personnel_scope = _merge_company_scope({"aktif": True}, current)
+    async for p in db.personnel.find(personnel_scope, {"_id": 0, "id": 1}):
         active_ids.add(p["id"])
         total_active += 1
 
@@ -6495,7 +6576,7 @@ async def dashboard_summary(_: dict = Depends(get_current_user)):
     # Toplam kalan izin + over-20 count
     total_remaining = 0.0
     over_20 = 0
-    async for p in db.personnel.find({"aktif": True}, {"_id": 0}):
+    async for p in db.personnel.find(personnel_scope, {"_id": 0}):
         bal = await _compute_entitlements(p)
         rem = float(bal.get("remaining") or 0)
         total_remaining += rem
@@ -6510,15 +6591,82 @@ async def dashboard_summary(_: dict = Depends(get_current_user)):
     }
 
 
+@api.get("/dashboard/today-on-leave")
+async def dashboard_today_on_leave(limit: int = 100, skip: int = 0,
+                                   current: dict = Depends(get_current_user)):
+    """Bugün izinli olan aktif personelleri listeler."""
+    today_iso = date.today().isoformat()
+
+    leave_map: dict = {}
+
+    async for L in db.leaves.find(
+        {
+            "start_date": {"$lte": today_iso},
+            "end_date": {"$gte": today_iso},
+        },
+        {"_id": 0},
+    ):
+        pid = L.get("personnel_id")
+        if not pid:
+            continue
+
+        # Aynı personelin aynı güne denk gelen birden fazla kaydı varsa
+        # listede yalnızca bir kez göster.
+        if pid not in leave_map:
+            leave_map[pid] = L
+
+    rows: List[dict] = []
+
+    if leave_map:
+        today_scope = _merge_company_scope({
+            "aktif": True,
+            "id": {"$in": list(leave_map.keys())},
+        }, current)
+        async for p in db.personnel.find(
+            today_scope,
+            {"_id": 0},
+        ):
+            L = leave_map.get(p["id"], {})
+
+            rows.append({
+                "id": p["id"],
+                "sicil_no": p.get("sicil_no"),
+                "ad_soyad": p.get("ad_soyad"),
+                "departman": p.get("departman"),
+                "sirket": p.get("sirket"),
+                "izin_turu": L.get("izin_turu"),
+                "start_date": L.get("start_date"),
+                "end_date": L.get("end_date"),
+                "days": L.get("days"),
+            })
+
+    rows.sort(
+        key=lambda r: (
+            (r.get("ad_soyad") or "").casefold(),
+            str(r.get("sicil_no") or ""),
+        )
+    )
+
+    total = len(rows)
+    limit = max(1, min(int(limit), 500))
+    skip = max(0, int(skip))
+
+    return {
+        "total": total,
+        "items": rows[skip:skip + limit],
+    }
+
+
 @api.get("/dashboard/over-20")
 async def dashboard_over_20(limit: int = 100, skip: int = 0,
-                             _: dict = Depends(get_current_user)):
+                             current: dict = Depends(get_current_user)):
     """Kalan izni 20 gün ve üzerinde olan aktif personel listesi (paginated).
     Iter 61: kriter `>= 20` olarak güncellendi (20, 20.5, 21+ dahil; 19.5 dahil değil).
     Response: {total, items[{id, sicil_no, ad_soyad, departman, remaining}]}
     """
     rows: List[dict] = []
-    async for p in db.personnel.find({"aktif": True}, {"_id": 0}):
+    scope = _merge_company_scope({"aktif": True}, current)
+    async for p in db.personnel.find(scope, {"_id": 0}):
         bal = await _compute_entitlements(p)
         rem = float(bal.get("remaining") or 0)
         if rem >= 20:

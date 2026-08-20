@@ -52,6 +52,23 @@ export function UsersTab() {
     } catch (e) { toast.error(formatApiError(e)); } finally { setDelBusy(false); }
   };
 
+  const companyAccess = (u) => {
+    if (u.role === "admin") {
+      return <Badge className="bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-50">Tüm Şirketler</Badge>;
+    }
+    const companies = u.allowed_companies || [];
+    if (companies.length === 0) {
+      return <Badge variant="secondary" className="bg-red-50 text-red-700 border border-red-200">Şirket Yetkisi Yok</Badge>;
+    }
+    return (
+      <div className="flex flex-wrap gap-1 max-w-[280px]">
+        {companies.map((c) => (
+          <Badge key={c} variant="secondary" className="bg-slate-100 text-slate-700 border border-slate-200">{c}</Badge>
+        ))}
+      </div>
+    );
+  };
+
   return (
     <>
       <div className="flex justify-end">
@@ -66,7 +83,7 @@ export function UsersTab() {
             <thead>
               <tr>
                 <th>Ad Soyad</th><th>Kullanıcı Adı</th><th>E-posta</th>
-                <th>Rol</th><th>Departman</th><th>Durum</th>
+                <th>Rol</th><th>Departman</th><th>Görebileceği Şirketler</th><th>Durum</th>
                 <th>Son Giriş</th><th>Son İşlem</th><th>Oluşturulma</th>
                 <th className="text-right">İşlemler</th>
               </tr>
@@ -80,6 +97,7 @@ export function UsersTab() {
                   <td>{u.email}</td>
                   <td>{roleBadge(u.role)}</td>
                   <td>{u.departman || "—"}</td>
+                  <td>{companyAccess(u)}</td>
                   <td>
                     {u.aktif === false
                       ? <Badge variant="secondary" className="bg-slate-100 text-slate-600">Pasif</Badge>
@@ -89,38 +107,22 @@ export function UsersTab() {
                   <td className="font-mono text-xs">{toDateTime(u.last_action)}</td>
                   <td className="font-mono text-xs">{toDateTime(u.created_at)}</td>
                   <td className="text-right whitespace-nowrap">
-                    <Button variant="ghost" size="sm" title="Düzenle"
-                            onClick={() => setEditUser(u)} data-testid={`edit-user-${u.email}`}>
-                      <Pencil size={14} />
-                    </Button>
-                    <Button variant="ghost" size="sm" title="Şifre Sıfırla"
-                            onClick={() => setResetUser(u)} data-testid={`reset-user-${u.email}`}>
-                      <KeyRound size={14} />
-                    </Button>
+                    <Button variant="ghost" size="sm" title="Düzenle" onClick={() => setEditUser(u)} data-testid={`edit-user-${u.email}`}><Pencil size={14} /></Button>
+                    <Button variant="ghost" size="sm" title="Şifre Sıfırla" onClick={() => setResetUser(u)} data-testid={`reset-user-${u.email}`}><KeyRound size={14} /></Button>
                     <Button variant="ghost" size="sm" title={u.aktif === false ? "Aktif Yap" : "Pasif Yap"}
                             className={u.aktif === false ? "text-emerald-600" : "text-amber-600"}
-                            onClick={() => toggleActive(u)}
-                            data-testid={`toggle-user-${u.email}`}
-                            disabled={u.id === me?.id}>
-                      <Power size={14} />
-                    </Button>
-                    <Button variant="ghost" size="sm" title="İşlem Geçmişi"
-                            onClick={() => setHistoryUser(u)} data-testid={`history-user-${u.email}`}>
-                      <History size={14} />
-                    </Button>
+                            onClick={() => toggleActive(u)} data-testid={`toggle-user-${u.email}`} disabled={u.id === me?.id}><Power size={14} /></Button>
+                    <Button variant="ghost" size="sm" title="İşlem Geçmişi" onClick={() => setHistoryUser(u)} data-testid={`history-user-${u.email}`}><History size={14} /></Button>
                     {u.id !== me?.id && (
-                      <Button variant="ghost" size="sm" title="Kullanıcıyı Sil"
-                              className="text-red-600 hover:bg-red-50"
+                      <Button variant="ghost" size="sm" title="Kullanıcıyı Sil" className="text-red-600 hover:bg-red-50"
                               onClick={() => { setDelTarget(u); setDelData({ password: "", reason: "" }); setDelStep(1); }}
-                              data-testid={`delete-user-${u.email}`}>
-                        <Trash2 size={14} />
-                      </Button>
+                              data-testid={`delete-user-${u.email}`}><Trash2 size={14} /></Button>
                     )}
                   </td>
                 </tr>
               ))}
               {items.length === 0 && (
-                <tr><td colSpan={10} className="text-center text-slate-400 py-8">Kullanıcı kaydı yok.</td></tr>
+                <tr><td colSpan={11} className="text-center text-slate-400 py-8">Kullanıcı kaydı yok.</td></tr>
               )}
             </tbody>
           </table>
@@ -132,7 +134,6 @@ export function UsersTab() {
       <ResetPasswordDialog user={resetUser} onOpenChange={(v) => !v && setResetUser(null)} />
       <UserHistoryDialog user={historyUser} onOpenChange={(v) => !v && setHistoryUser(null)} />
 
-      {/* Kullanıcı Silme — 2 aşamalı */}
       <Dialog open={delStep === 1} onOpenChange={(v) => !v && setDelStep(0)}>
         <DialogContent data-testid="user-delete-step1">
           <DialogHeader>
@@ -153,6 +154,7 @@ export function UsersTab() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
       <Dialog open={delStep === 2} onOpenChange={(v) => !v && setDelStep(0)}>
         <DialogContent data-testid="user-delete-step2">
           <DialogHeader>

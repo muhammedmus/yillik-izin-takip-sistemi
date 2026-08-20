@@ -54,6 +54,8 @@ export default function Personnel() {
   const [summary, setSummary] = useState(null);
   const [over20, setOver20] = useState({ total: 0, items: [] });
   const [over20Open, setOver20Open] = useState(false);
+  const [todayOnLeave, setTodayOnLeave] = useState({ total: 0, items: [] });
+  const [todayOnLeaveOpen, setTodayOnLeaveOpen] = useState(false);
   const [companies, setCompanies] = useState([]);
 
   const [importOpen, setImportOpen] = useState(false);
@@ -156,12 +158,14 @@ export default function Personnel() {
   // Iter 48: Panel özet + 20 Gün Üzeri (yalnız aktif sekmesindeyken göster)
   const loadSummary = async () => {
     try {
-      const [{ data: s }, { data: o }] = await Promise.all([
+      const [{ data: s }, { data: o }, { data: t }] = await Promise.all([
         api.get("/dashboard/summary"),
         api.get("/dashboard/over-20", { params: { limit: 100 } }),
+        api.get("/dashboard/today-on-leave", { params: { limit: 500 } }),
       ]);
       setSummary(s);
       setOver20(o || { total: 0, items: [] });
+      setTodayOnLeave(t || { total: 0, items: [] });
     } catch { /* sessiz */ }
   };
   useEffect(() => { loadSummary(); }, []);
@@ -570,15 +574,26 @@ export default function Personnel() {
                 </div>
               </div>
             </Card>
-            <Card className="p-4 border border-slate-200 shadow-sm h-full" data-testid="stat-today-on-leave">
+            <button
+              type="button"
+              onClick={() => {
+                setTodayOnLeaveOpen((v) => !v);
+                setOver20Open(false);
+              }}
+              className={`text-left h-full rounded-lg border shadow-sm transition p-4 bg-white hover:bg-emerald-50 ${todayOnLeaveOpen ? "border-emerald-400 ring-2 ring-emerald-300" : "border-slate-200"}`}
+              data-testid="stat-today-on-leave"
+            >
               <div className="flex items-start gap-3">
                 <div className="w-9 h-9 rounded-md grid place-items-center bg-emerald-50 text-emerald-700"><PartyPopper size={18} /></div>
                 <div className="flex-1 min-w-0">
                   <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Bugün İzinli</div>
-                  <div className="text-2xl font-bold text-slate-900 mt-0.5 tabular-nums">{summary?.today_on_leave ?? "…"}</div>
+                  <div className="text-2xl font-bold text-slate-900 mt-0.5 tabular-nums flex items-center gap-2">
+                    <span>{summary?.today_on_leave ?? "…"} kişi</span>
+                    <span className="text-slate-400 ml-auto">{todayOnLeaveOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}</span>
+                  </div>
                 </div>
               </div>
-            </Card>
+            </button>
             <Card className="p-4 border border-slate-200 shadow-sm h-full" data-testid="stat-total-remaining">
               <div className="flex items-start gap-3">
                 <div className="w-9 h-9 rounded-md grid place-items-center bg-slate-100 text-slate-700"><TrendingUp size={18} /></div>
@@ -592,7 +607,10 @@ export default function Personnel() {
             </Card>
             <button
               type="button"
-              onClick={() => setOver20Open((v) => !v)}
+              onClick={() => {
+                setOver20Open((v) => !v);
+                setTodayOnLeaveOpen(false);
+              }}
               className={`text-left h-full rounded-lg border shadow-sm transition p-4 bg-white hover:bg-amber-50 ${over20Open ? "border-amber-400 ring-2 ring-amber-300" : "border-slate-200"}`}
               data-testid="stat-over20-card"
             >
@@ -608,6 +626,37 @@ export default function Personnel() {
               </div>
             </button>
           </div>
+
+          {todayOnLeaveOpen && (
+            <Card className="border border-emerald-200 shadow-sm" data-testid="today-on-leave-list">
+              <div className="px-4 py-3 border-b border-emerald-100 bg-emerald-50/50">
+                <div className="font-semibold text-emerald-900">Bugün İzinli Personeller</div>
+                <div className="text-xs text-emerald-700 mt-0.5">Bugün izin başlangıç ve bitiş tarihleri arasında bulunan aktif personeller</div>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="table-clean w-full text-sm">
+                  <thead><tr><th>Sicil</th><th>Ad Soyad</th><th>Departman</th><th>Şirket</th><th>İzin Türü</th><th>Başlangıç</th><th>Bitiş</th><th className="text-right">Gün</th></tr></thead>
+                  <tbody>
+                    {todayOnLeave.items.length === 0 && (
+                      <tr><td colSpan={8} className="text-center text-slate-400 py-4">Bugün izinli personel yok.</td></tr>
+                    )}
+                    {todayOnLeave.items.map((r) => (
+                      <tr key={r.id} data-testid={`today-leave-row-${r.sicil_no}`}>
+                        <td className="font-mono text-xs">{r.sicil_no}</td>
+                        <td><Link to={`/personel/${r.id}`} className="font-medium text-blue-700 hover:underline">{r.ad_soyad}</Link></td>
+                        <td>{r.departman || "—"}</td>
+                        <td>{r.sirket || "—"}</td>
+                        <td>{r.izin_turu || "—"}</td>
+                        <td className="font-mono text-xs">{toTr(r.start_date)}</td>
+                        <td className="font-mono text-xs">{toTr(r.end_date)}</td>
+                        <td className="text-right tabular-nums font-semibold text-emerald-700">{fmtNum(r.days)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
 
           {/* Açılır liste — 4. karttan */}
           {over20Open && (
