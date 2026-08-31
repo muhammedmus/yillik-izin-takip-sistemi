@@ -79,7 +79,7 @@ export default function Dashboard() {
     <div className="space-y-6">
       <div className="sticky-page-title">
         <h1 className="text-3xl font-bold tracking-tight text-slate-900">Panel</h1>
-        <p className="text-sm text-slate-500 mt-1">Merkoteks Personel ve İzin Sistemi genel durum özeti.</p>
+        <p className="text-sm text-slate-500 mt-1">Personel İzin Takip Sistemi genel durum özeti.</p>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">

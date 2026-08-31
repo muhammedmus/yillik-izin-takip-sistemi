@@ -387,7 +387,7 @@ function NotificationEmailCard() {
               onChange={(e) =>
                 setEmail(e.target.value)
               }
-              placeholder="ornek@merkoteks.com"
+              placeholder="ornek@sirket.com"
               className="max-w-md"
               data-testid="notification-email-input"
             />

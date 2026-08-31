@@ -44,15 +44,13 @@ export default function Login() {
           <div className="flex items-center gap-3">
             <div className="w-11 h-11 rounded-md bg-blue-600 grid place-items-center"><Building2 /></div>
             <div>
-              <div className="text-lg font-semibold tracking-tight">MERKOTEKS</div>
-              <div className="text-xs text-blue-100">Personel & İzin Sistemi</div>
+              <div className="text-lg font-semibold tracking-tight">PERSONEL İZİN TAKİP SİSTEMİ</div>
             </div>
           </div>
           <div>
             <h1 className="text-4xl font-bold leading-tight max-w-md">Personelinizi ve yıllık izinlerini tek panelden yönetin.</h1>
-            <p className="mt-3 text-blue-100 max-w-md text-sm">Türkiye resmi tatilleri, kıdem hesaplaması ve A4 izin formu — hepsi hazır.</p>
           </div>
-          <div className="text-[11px] text-blue-200">© {new Date().getFullYear()} Merkoteks</div>
+          <div className="text-[11px] text-blue-200">© {new Date().getFullYear()} Personel İzin Takip Sistemi</div>
         </div>
       </div>
 
@@ -61,8 +59,7 @@ export default function Login() {
           <div className="lg:hidden flex items-center gap-2">
             <div className="w-10 h-10 rounded-md bg-blue-600 text-white grid place-items-center"><Building2 size={20} /></div>
             <div>
-              <div className="text-base font-semibold">MERKOTEKS</div>
-              <div className="text-xs text-slate-500">Personel & İzin Sistemi</div>
+              <div className="text-base font-semibold">PERSONEL İZİN TAKİP SİSTEMİ</div>
             </div>
           </div>
           <div>
@@ -73,7 +70,7 @@ export default function Login() {
             <div>
               <Label htmlFor="email">E-posta</Label>
               <Input id="email" data-testid="login-email" type="email" value={email}
-                onChange={(e) => setEmail(e.target.value)} required autoFocus placeholder="ornek@merkoteks.com" />
+                onChange={(e) => setEmail(e.target.value)} required autoFocus placeholder="ornek@sirket.com" />
             </div>
             <div>
               <Label htmlFor="password">Şifre</Label>
