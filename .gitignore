@@ -49,3 +49,6 @@ test_result.md
 design_guidelines.json
 deploy/
 .gitconfig
+
+# Yedek dosyalar
+*.yedek*

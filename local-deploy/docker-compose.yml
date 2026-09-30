@@ -1,5 +1,4 @@
 version: "3.9"
-
 # =============================================================================
 # Merkoteks Personel & İzin Sistemi — On-Premise LAN Deployment
 # =============================================================================
@@ -12,11 +11,9 @@ version: "3.9"
 #   mongodb-data  →  ${DATA_DIR}/mongodb    (host bind mount)
 #   uploads-data  →  ${DATA_DIR}/uploads    (host bind mount)
 # =============================================================================
-
 networks:
   merkoteks-internal:
     driver: bridge
-
 volumes:
   mongodb-data:
     driver: local
@@ -30,7 +27,6 @@ volumes:
       type: none
       o: bind
       device: ${DATA_DIR}/uploads
-
 services:
   # --------------------------------------------------------------------------
   # MongoDB 7 — sadece internal network, port EXPOSE EDİLMİYOR
@@ -51,7 +47,6 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
-
   # --------------------------------------------------------------------------
   # Backend — FastAPI + LibreOffice headless (PDF)
   # --------------------------------------------------------------------------
@@ -80,6 +75,12 @@ services:
       # Emergent-only key'ler local için gerekmiyor
       EMERGENT_LLM_KEY: ""
       EMERGENT_EMAIL_KEY: ""
+      # Günlük izin raporu — SMTP (Gmail) ayarları
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      DAILY_REPORT_EMAIL: "${DAILY_REPORT_EMAIL:-}"
     volumes:
       - uploads-data:/data/uploads
     networks:
@@ -91,7 +92,6 @@ services:
       timeout: 6s
       retries: 5
       start_period: 45s
-
   # --------------------------------------------------------------------------
   # Nginx reverse proxy — TEK LAN GİRİŞ NOKTASI (port 80)
   # Frontend static + /api → backend

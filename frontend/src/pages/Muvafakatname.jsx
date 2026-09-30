@@ -50,6 +50,10 @@ export default function Muvafakatname() {
   const L = d.leave;
   const bal = d.balance;
   const nextEnt = bal?.next_entitlement?.date;
+  // Iter 61: Metinde izin talebinin TAMAMI değil, sadece hak edilmemiş
+  // (avans) gün sayısı gösterilmeli — backend bunu consent_advance_days
+  // olarak, aynı gündeki diğer izinlerle tutarlı şekilde hesaplayıp döner.
+  const advanceDays = d.consent_advance_days ?? L.days;
 
   const doDownload = (kind) => {
     // Muvafakatname için Excel/PDF endpoint henüz backendde yok — HTML print/PDF-save fallback
@@ -83,11 +87,16 @@ export default function Muvafakatname() {
       onPrint={doPrint}
       onPdf={() => doDownload("pdf")}
     >
-      <div
-        className="document-preview bg-white p-16 print-page shadow-md mx-auto"
-        style={{ fontFamily: "'Times New Roman', Georgia, serif", fontSize: "12pt", lineHeight: 1.8, maxWidth: "800px" }}
-        data-testid="muvafakatname-body"
-      >
+      <div className="w-full flex justify-center px-6 md:px-12 print:px-0 print:block">
+        <div
+          className="document-preview bg-white p-16 print-page shadow-md w-full max-w-[800px] mt-8 mx-auto print:w-auto print:max-w-none print:mt-0 print:ml-0 print:mr-0 print:p-0 print:shadow-none"
+          style={{
+            fontFamily: "'Times New Roman', Georgia, serif",
+            fontSize: "12pt",
+            lineHeight: 1.8,
+          }}
+          data-testid="muvafakatname-body"
+        >
         <div className="text-center mb-14">
           <h1 className="text-3xl font-bold uppercase tracking-wider" style={{ letterSpacing: "0.1em" }}>MUVAFAKATNAME</h1>
         </div>
@@ -102,13 +111,13 @@ export default function Muvafakatname() {
         <p className="text-justify mb-6" style={{ textIndent: "3em" }}>
           İşverenlikten henüz yıllık ücretli izne hak kazanmamama rağmen{" "}
           <b>{toTr(L.start_date)}</b> tarihinden itibaren{" "}
-          <b>{fmtDays(L.days)}</b> yıllık izin talep etmekteyim.
+          <b>{fmtDays(advanceDays)}</b> yıllık izin talep etmekteyim.
         </p>
 
         <p className="text-justify mb-20" style={{ textIndent: "3em" }}>
           Yıllık ücretli izne hak kazanacağım <b>{toTr(nextEnt)}</b>{" "}
           tarihinden önce işyerinden ayrılmam söz konusu olursa,
-          hak etmeden kullandığım <b>{fmtDays(L.days)}</b> izne
+          hak etmeden kullandığım <b>{fmtDays(advanceDays)}</b> izne
           ait ücretin işten ayrılış sürecimde hak etmiş olduğum son ücretimden
           düşülmesine onay veriyorum.
         </p>
@@ -116,6 +125,7 @@ export default function Muvafakatname() {
         <div className="mt-24 space-y-6">
           <div>ADI SOYADI : <b>{p?.ad_soyad || "—"}</b></div>
           <div>İMZA&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:</div>
+        </div>
         </div>
       </div>
     </DocumentPreviewShell>

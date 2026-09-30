@@ -32,7 +32,7 @@ db = client[os.environ["DB_NAME"]]
 
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGO = "HS256"
-JWT_EXP_MIN = 60 * 24  # 24h for internal desktop app
+JWT_EXP_MIN = 60 * 24 * 30  # 30 gün — dahili masaüstü uygulaması, sık tekrar giriş istenmesin
 
 app = FastAPI(title="Merkoteks Personel ve İzin Sistemi")
 api = APIRouter(prefix="/api")
@@ -147,24 +147,28 @@ def _tr_lower(value: str) -> str:
 
 
 def _tr_search_regex(value: str) -> str:
-    """MongoDB regex aramasında Türkçe büyük/küçük harf eşleşmesini güvenilir yapar."""
-    equivalents = {
-        "i": "[iİ]",
-        "İ": "[iİ]",
-        "ı": "[ıI]",
-        "I": "[ıI]",
-        "ş": "[şŞ]",
-        "Ş": "[şŞ]",
-        "ğ": "[ğĞ]",
-        "Ğ": "[ğĞ]",
-        "ü": "[üÜ]",
-        "Ü": "[üÜ]",
-        "ö": "[öÖ]",
-        "Ö": "[öÖ]",
-        "ç": "[çÇ]",
-        "Ç": "[çÇ]",
+    """MongoDB regex aramasında Türkçe büyük/küçük harf eşleşmesini güvenilir
+    yapar. Ayrıca düz ASCII harflerle Türkçe karşılıklarını da eşleştirir —
+    örn. "gokhan" yazınca "GÖKHAN" da, "ismail" yazınca "İSMAİL" de bulunur.
+    (09.09.2026: önceki hâli sadece Türkçe harfin kendi büyük/küçük çiftini
+    eşleştiriyordu — "gokhan" aramasında "ö" harfi eksik kaldığı için
+    "GÖKHAN" hiç bulunamıyordu.)"""
+    groups = {
+        "c": "[cçCÇ]", "g": "[gğGĞ]", "o": "[oöOÖ]",
+        "s": "[sşSŞ]", "u": "[uüUÜ]", "i": "[iİıI]",
     }
-    return "".join(equivalents.get(ch, re.escape(ch)) for ch in (value or "").strip())
+    # Türkçe karakterlerin/varyantlarının hangi gruba ait olduğunu belirt
+    # (İ, ı, I hepsi aynı "i" grubuna gider — çoğu kullanıcı ASCII klavyede
+    # dotlu/dotsuz ayrımı yapmadan düz "I" veya "i" yazıyor).
+    alias = {
+        "ç": "c", "Ç": "c", "ğ": "g", "Ğ": "g", "ö": "o", "Ö": "o",
+        "ş": "s", "Ş": "s", "ü": "u", "Ü": "u", "ı": "i", "İ": "i", "I": "i",
+    }
+    out = []
+    for ch in (value or "").strip():
+        base = alias.get(ch) or (ch.lower() if ch.lower() in groups else None)
+        out.append(groups[base] if base else re.escape(ch))
+    return "".join(out)
 
 
 # -----------------------------------------------------------------------------
@@ -224,20 +228,28 @@ def _company_scope_filter(user: dict) -> dict:
     allowed = _allowed_companies(user)
     if allowed is None:
         return {}
-    if not allowed:
-        return {"sirket": "__NO_COMPANY_ACCESS__"}
-    return {"sirket": {"$in": allowed}}
+    # ZK/Access gibi dış kaynaklardan otomatik eklenmiş, henüz şirketi
+    # belirlenmemiş ("needs_completion") personel şirket kapsamından
+    # BAĞIMSIZ olarak tüm yetkili (İK vb.) kullanıcılara görünür olmalı —
+    # aksi halde sadece belirli şirketleri gören bir İK personeli bu
+    # kayıtları hiç göremez ve bilgi tamamlama işini yapamaz.
+    company_clause = {"sirket": {"$in": allowed}} if allowed else {"sirket": "__NO_COMPANY_ACCESS__"}
+    return {"$or": [company_clause, {"needs_completion": True}]}
 
 
 def _merge_company_scope(filt: Optional[dict], user: dict) -> dict:
+    """filt (örn. arama/departman filtresi) ile şirket kapsamını GÜVENLE birleştirir.
+    Önceki basit `dict.update()` yaklaşımı, ikisi de aynı anahtarı (örn. "$or" —
+    hem arama hem şirket kapsamı bunu kullanabiliyor) kullandığında birbirinin
+    üzerine yazıp arama/filtreyi sessizce SİLİYORDU. Artık her zaman $and ile
+    sarmalanıyor, anahtar çakışması riski yok."""
     base = dict(filt or {})
     scope = _company_scope_filter(user)
     if not scope:
         return base
-    if "sirket" in base:
-        return {"$and": [base, scope]}
-    base.update(scope)
-    return base
+    if not base:
+        return scope
+    return {"$and": [base, scope]}
 
 
 async def _ensure_personnel_company_access(pid: str, user: dict) -> dict:
@@ -245,7 +257,10 @@ async def _ensure_personnel_company_access(pid: str, user: dict) -> dict:
     if not p:
         raise HTTPException(status_code=404, detail="Personel bulunamadı")
     allowed = _allowed_companies(user)
-    if allowed is not None and p.get("sirket") not in allowed:
+    # needs_completion=True olan (şirketi henüz belirlenmemiş) personel,
+    # şirket kısıtlamasından bağımsız olarak herkese açık — bkz.
+    # _company_scope_filter'daki aynı mantık.
+    if allowed is not None and not p.get("needs_completion") and p.get("sirket") not in allowed:
         raise HTTPException(status_code=403, detail="Bu personelin şirketini görüntüleme yetkiniz yok")
     return p
 
@@ -396,6 +411,19 @@ def _fmt_tr_num(x) -> str:
     if abs(n - round(n)) < 1e-9:
         return str(int(round(n)))
     return f"{n:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def _resolve_isbasi(L: dict, holidays: dict) -> Optional[str]:
+    """Bir izin kaydının işbaşı/dönüş tarihini döner — kayıtta elle
+    düzeltilmiş bir 'isbasi_override' varsa onu, yoksa bitiş tarihi +
+    tatiller ile otomatik hesaplanan değeri kullanır."""
+    override = L.get("isbasi_override")
+    if override:
+        return override[:10]
+    try:
+        return _next_working_day(date.fromisoformat(L["end_date"][:10]), holidays).isoformat()
+    except Exception:
+        return None
 
 
 def _next_working_day(after_end: date, holidays: dict) -> date:
@@ -658,6 +686,11 @@ class Personnel(BaseModel):
     telefon: str = ""
     email: Optional[str] = ""
     aciklama: str = ""
+    # ZKAccess gibi dış kaynaklardan sadece ad/soyad/sicil ile otomatik
+    # eklenen personel için True — detay sayfasında "bilgileri tamamlayın"
+    # uyarısı göstermek amacıyla kullanılır. Personel elle düzenlenip
+    # kaydedildiğinde otomatik False'a döner.
+    needs_completion: bool = False
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 class PersonnelIn(BaseModel):
@@ -675,6 +708,7 @@ class PersonnelIn(BaseModel):
     telefon: str = ""
     email: Optional[str] = ""
     aciklama: str = ""
+    needs_completion: bool = False
 
 class LeaveRecord(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -685,6 +719,9 @@ class LeaveRecord(BaseModel):
     days: float
     izin_turu: str = "Yıllık İzin"
     aciklama: str = ""
+    # Elle düzeltilmiş işbaşı/dönüş tarihi — None ise sistemin otomatik
+    # hesapladığı (bitiş tarihi + tatiller) değer kullanılır.
+    isbasi_override: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     created_by: Optional[str] = None
@@ -695,6 +732,13 @@ class LeaveIn(BaseModel):
     end_date: str
     izin_turu: str = "Yıllık İzin"
     aciklama: str = ""
+    # İzin düzenleme ekranından, sistemin tarihten otomatik hesapladığı gün
+    # sayısını elle düzeltebilmek için — None ise (normal oluşturma akışında
+    # olduğu gibi) otomatik hesaplanan değer aynen kullanılır, dokunulmaz.
+    days_override: Optional[float] = None
+    # Aynı şekilde işbaşı/dönüş tarihi için elle düzeltme — None ise
+    # otomatik hesaplanan (bitiş tarihi + tatiller) değer kullanılır.
+    return_date_override: Optional[str] = None
 
 # === Iter 54: ÖZEL İZİNLER (yıllık izin sisteminden TAM AYRI koleksiyon) ===
 SPECIAL_LEAVE_TYPES = ["gebelik", "dogum", "sut_izni", "evlilik", "cenaze", "diger"]
@@ -1809,6 +1853,15 @@ def _dict_diff(old: dict, new: dict) -> tuple:
 # -----------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup():
+    # PDF önizlemelerini (İzin Cetveli / Talep Formu / Muvafakatname) hızlandırmak
+    # için LibreOffice'i şimdiden arka planda açık tutmaya başla — bkz.
+    # _ensure_libreoffice_listener(). unoconv kurulu değilse bu no-op'tur,
+    # hiçbir şeyi bozmaz.
+    try:
+        _ensure_libreoffice_listener()
+    except Exception:
+        log.exception("LibreOffice ön-ısıtma başarısız (kritik değil, PDF üretimi eski yöntemle çalışmaya devam eder).")
+
     # Kritik indexler — büyük veri kümesinde sorgu hızı için
     try:
         await db.leaves.create_index("start_date")
@@ -1870,6 +1923,13 @@ async def startup():
     await db.users.update_many({"username": {"$exists": False}}, [{"$set": {"username": "$email"}}])
     await db.users.update_many({"departman": {"$exists": False}}, {"$set": {"departman": ""}})
     await db.users.update_many({"aciklama": {"$exists": False}}, {"$set": {"aciklama": ""}})
+    # needs_completion alanı hiç olmayan (bu özellik eklenmeden önce oluşturulmuş)
+    # eski personel kayıtlarına açıkça False yaz. Aksi halde MongoDB sıralamada
+    # "alan hiç yok" ile "alan açıkça False" durumlarını FARKLI kategori sayıyor —
+    # bu da tamamlanan ZK kayıtlarının gerçek alfabetik listeye karışmayıp kendi
+    # aralarında görünmez bir ara grup oluşturmasına yol açıyordu (09.09.2026'da
+    # gözlemlendi). İdempotent — her başlangıçta çalışır, zararsız.
+    await db.personnel.update_many({"needs_completion": {"$exists": False}}, {"$set": {"needs_completion": False}})
 
     # seed admin (idempotent + duplicate-key guard)
     # Iter 60: Windows local Docker'da restart sonrası E11000 duplicate key hatası
@@ -2137,7 +2197,7 @@ async def leaves_export_xlsx(personnel_id: Optional[str] = None,
     async for L in db.leaves.find(filt, {"_id": 0}).sort("start_date", -1):
         p = p_cache.get(L["personnel_id"], {})
         try:
-            isbasi = _next_working_day(date.fromisoformat(L["end_date"]), holidays).isoformat()
+            isbasi = _resolve_isbasi(L, holidays) or ""
         except Exception:
             isbasi = ""
         ws.cell(row=r, column=1, value=p.get("sicil_no", ""))
@@ -3009,16 +3069,25 @@ async def personnel_balance_summary(aktif: Optional[bool] = None, current: dict 
     if aktif is not None:
         q["aktif"] = aktif
     q = _merge_company_scope(q, current)
-    # Tüm izinleri tek seferde çek — personel bazlı grupla (N+1 önle)
+    # Tüm izinleri VE tüm hak edişleri tek seferde çek — personel bazlı grupla
+    # (N+1 önle: 300 personelde bunu döngü içinde çekmek 600+ ekstra
+    # DB round-trip'e yol açıyordu, liste yavaşlığının asıl sebebi buydu).
     leaves_by_pid: dict = {}
     async for L in db.leaves.find({}, {"_id": 0, "personnel_id": 1, "start_date": 1,
                                          "end_date": 1, "days": 1, "izin_turu": 1}):
         leaves_by_pid.setdefault(L.get("personnel_id"), []).append(L)
+    entitlements_by_pid: dict = {}
+    async for e in db.entitlements.find({}, {"_id": 0}):
+        entitlements_by_pid.setdefault(e.get("personnel_id"), []).append(e)
     today = date.today()
     out = []
     async for p in db.personnel.find(q, {"_id": 0}):
         try:
-            bal = await _compute_entitlements(p)
+            bal = await _compute_entitlements(
+                p,
+                _entitlements_cache=entitlements_by_pid,
+                _leaves_cache=leaves_by_pid.get(p["id"], []),
+            )
             ten = _ten_day_check_from_leaves(
                 bal.get("entitlements", []),
                 (bal.get("next_entitlement") or {}).get("date"),
@@ -3072,10 +3141,17 @@ async def _advance_ok_pids() -> set:
     leaves_by_pid: dict = {}
     async for L in db.leaves.find({"personnel_id": {"$in": [p["id"] for p in p_list]}}, {"_id": 0}):
         leaves_by_pid.setdefault(L["personnel_id"], []).append(L)
+    entitlements_by_pid: dict = {}
+    async for e in db.entitlements.find({"personnel_id": {"$in": [p["id"] for p in p_list]}}, {"_id": 0}):
+        entitlements_by_pid.setdefault(e.get("personnel_id"), []).append(e)
     pids = set()
     for p in p_list:
         try:
-            bal = await _compute_entitlements(p)
+            bal = await _compute_entitlements(
+                p,
+                _entitlements_cache=entitlements_by_pid,
+                _leaves_cache=leaves_by_pid.get(p["id"], []),
+            )
         except Exception:
             continue
         tdc = _ten_day_check_from_leaves(
@@ -3096,10 +3172,15 @@ async def list_personnel(
     sort_by: str = "ad_soyad", sort_dir: str = "asc",
     limit: Optional[int] = None, skip: int = 0,
     consent_advance: bool = False,
+    group_incomplete_first: bool = False,
     current: dict = Depends(get_current_user),
 ):
     """Personel listesi. Yeni: sort_by/sort_dir/limit/skip server-side. Tüm listeye ihtiyaç varsa limit=None.
     consent_advance=True → sadece ten_day_check.status='advance_ok' olan personeller (Sarı Rozet).
+    group_incomplete_first=True → needs_completion=True olan personel (örn. ZKAccess'ten
+    sadece ad/sicil ile otomatik eklenmiş, bilgileri henüz tamamlanmamış kayıtlar) sıralamadan
+    bağımsız olarak HER ZAMAN en üstte gösterilir; kendi aralarında yine seçilen sort_by/sort_dir
+    uygulanır. Kullanıcı normal alfabetik sıralamaya dönmek isterse bu parametreyi False geçsin.
     """
     filt = _merge_company_scope(_build_personnel_filter(q, departman, sirket, aktif), current)
     if consent_advance:
@@ -3108,7 +3189,8 @@ async def list_personnel(
     allowed_sort = {"ad_soyad", "sicil_no", "departman", "sirket", "ise_giris", "aktif"}
     field = sort_by if sort_by in allowed_sort else "ad_soyad"
     direction = -1 if str(sort_dir).lower() == "desc" else 1
-    cursor = db.personnel.find(filt, {"_id": 0}).sort(field, direction)
+    sort_spec = [("needs_completion", -1), (field, direction)] if group_incomplete_first else [(field, direction)]
+    cursor = db.personnel.find(filt, {"_id": 0}).sort(sort_spec)
     if skip:
         cursor = cursor.skip(int(skip))
     if limit is not None:
@@ -3188,8 +3270,30 @@ async def update_personnel(pid: str, body: PersonnelIn, request: Request, curren
         })
     new_data = body.model_dump()
     new_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    # Bu formdan gelen HER kayıt admin tarafından elle doldurulup kaydedildiği
+    # anlamına gelir — ZKAccess'ten "eksik bilgi" olarak gelmiş olsa bile
+    # artık tamamlanmış sayılır.
+    new_data["needs_completion"] = False
     await db.personnel.update_one({"id": pid}, {"$set": new_data})
     p = await db.personnel.find_one({"id": pid}, {"_id": 0})
+
+    # Otomatik hak ediş yeniden hesaplama: "Önceki Kıdem", işe giriş veya doğum
+    # tarihi değiştiyse, o tarihe kadar zaten hesaplanıp dondurulmuş
+    # (immutable) hak ediş kayıtları GÜNCEL değerlerle otomatik yeniden
+    # üretilir — admin ayrıca bir "yeniden hesapla" düğmesine basmak zorunda
+    # kalmaz, sadece normal "Güncelle" akışı yeterlidir. Kullanılmış izinlere
+    # (leaves) kesinlikle dokunulmaz.
+    seniority_fields_changed = any(
+        str(existing.get(f) or "") != str(new_data.get(f) or "")
+        for f in ("onceki_kidem_yil", "ise_giris", "dogum_tarihi")
+    )
+    if seniority_fields_changed:
+        try:
+            await _recompute_entitlements_for(p)
+        except Exception:
+            log.exception("Personel güncellemesi sonrası otomatik hak ediş "
+                           "yeniden hesaplama başarısız (pid=%s).", pid)
+
     changed_old, changed_new = _dict_diff(existing, body.model_dump())
     action = "update"
     desc = f"Personel güncellendi: {p.get('ad_soyad')}"
@@ -3222,7 +3326,7 @@ async def delete_personnel(pid: str, request: Request, current: dict = Depends(r
 
 class PersonnelDeleteIn(BaseModel):
     password: str
-    reason: str
+    reason: str = ""
 
 @api.get("/personnel/{pid}/delete-preview")
 async def personnel_delete_preview(pid: str, _: dict = Depends(require_roles("admin"))):
@@ -3242,14 +3346,15 @@ async def personnel_delete_preview(pid: str, _: dict = Depends(require_roles("ad
 @api.post("/personnel/{pid}/delete")
 async def personnel_hard_delete(pid: str, body: PersonnelDeleteIn, request: Request,
                                  current: dict = Depends(require_roles("admin"))):
-    """Yönetici şifresi + gerekçe ile 2 aşamalı kalıcı silme. Audit korunur."""
-    if not body.password or not body.reason or not body.reason.strip():
-        raise HTTPException(status_code=400, detail="Yönetici şifresi ve silme gerekçesi zorunlu")
+    """Yönetici şifresi ile 2 aşamalı kalıcı silme (gerekçe isteğe bağlı). Audit korunur."""
+    if not body.password:
+        raise HTTPException(status_code=400, detail="Yönetici şifresi zorunlu")
     admin = await db.users.find_one({"id": current["id"]})
     if not admin or not verify_password(body.password, admin.get("password_hash", "")):
         await _audit(action="delete_failed", module="personnel", entity_type="personnel",
                      entity_id=pid, entity_name=None,
-                     description=f"Personel silme reddedildi (şifre doğrulanamadı) — gerekçe: {body.reason[:200]}",
+                     description=f"Personel silme reddedildi (şifre doğrulanamadı)"
+                                 + (f" — gerekçe: {body.reason[:200]}" if body.reason and body.reason.strip() else ""),
                      request=request, user=current, success=False)
         raise HTTPException(status_code=403, detail="Yönetici şifresi doğrulanamadı. Personel silinmedi.")
     existing = await db.personnel.find_one({"id": pid}, {"_id": 0})
@@ -3317,11 +3422,21 @@ def _days_for_seniority(total_seniority: int, age_at: Optional[float]) -> tuple:
     age_days = 20 if (age_at is not None and (age_at < 19 or age_at >= 50)) else 0
     return max(base, age_days), base, age_days
 
-async def _compute_entitlements(personnel: dict, as_of: Optional[date] = None) -> dict:
+async def _compute_entitlements(personnel: dict, as_of: Optional[date] = None,
+                                 _entitlements_cache: Optional[dict] = None,
+                                 _leaves_cache: Optional[list] = None) -> dict:
     """Yeni hak ediş sistemi:
        - İlk hak ediş = son işe giriş + 1 yıl
        - Önceki kıdem geçmiş tarihe yansıtılmaz, sadece hak ediş gününde toplam kıdeme eklenir
        - Her hak ediş kaydı immutable — DB'ye yazıldıktan sonra parametreler değişse de bozulmaz
+
+    Performans notu: personel listesi gibi TÜM personel için bu fonksiyonu art
+    arda çağıran uç noktalar (personnel_balance_summary, _advance_ok_pids),
+    her personel için ayrı ayrı db.entitlements/db.leaves sorgusu atmak yerine
+    (N+1 sorgu — 300 personelde 600+ ekstra round-trip demek), verileri TEK
+    seferde toplu çekip _entitlements_cache / _leaves_cache üzerinden bu
+    fonksiyona iletmelidir. Parametreler verilmezse eski (tek personelli)
+    davranışa geri döner — mevcut çağıran yerler bozulmaz.
     """
     hire = _parse_date(personnel["ise_giris"])
     empty = {"entitled_total": 0, "used_total": 0, "remaining": 0,
@@ -3334,8 +3449,12 @@ async def _compute_entitlements(personnel: dict, as_of: Optional[date] = None) -
     prev_years = int(personnel.get("onceki_kidem_yil") or 0)
 
     existing = {}
-    async for e in db.entitlements.find({"personnel_id": personnel["id"]}, {"_id": 0}):
-        existing[e["date"]] = e
+    if _entitlements_cache is not None:
+        for e in _entitlements_cache.get(personnel["id"], []):
+            existing[e["date"]] = e
+    else:
+        async for e in db.entitlements.find({"personnel_id": personnel["id"]}, {"_id": 0}):
+            existing[e["date"]] = e
 
     entitlements: list = []
     y = 1
@@ -3388,8 +3507,12 @@ async def _compute_entitlements(personnel: dict, as_of: Optional[date] = None) -
 
     entitled_total = sum(x["days"] for x in entitlements)
     used = 0.0
-    async for L in db.leaves.find({"personnel_id": personnel["id"]}, {"_id": 0, "days": 1}):
-        used += float(L.get("days", 0))
+    if _leaves_cache is not None:
+        for L in _leaves_cache:
+            used += float(L.get("days", 0))
+    else:
+        async for L in db.leaves.find({"personnel_id": personnel["id"]}, {"_id": 0, "days": 1}):
+            used += float(L.get("days", 0))
     remaining = entitled_total - used
 
     # Yeni çalışma döneminde tamamlanan hizmet yılı
@@ -3567,7 +3690,25 @@ async def leaves_preview(body: LeaveIn, _: dict = Depends(get_current_user)):
     s = _parse_date(body.start_date); e = _parse_date(body.end_date)
     if not s or not e or e < s:
         raise HTTPException(status_code=400, detail="Geçersiz tarih aralığı")
-    return await calc_leave_days(s, e)
+    result = await calc_leave_days(s, e)
+
+    # Iter 62: Bu izin KAYDEDİLMEDEN ÖNCE, hak edilen bakiyeyi aşıp aşmayacağını
+    # (muvafakatname gerekip gerekmeyeceğini) canlı olarak hesapla — kullanıcı
+    # tarih seçerken formda görsün, kaydetmeden sonra sürpriz olmasın.
+    result["consent_required"] = False
+    result["consent_advance_days"] = 0
+    if body.personnel_id:
+        p = await db.personnel.find_one({"id": body.personnel_id}, {"_id": 0})
+        if p:
+            bal = await _compute_entitlements(p)
+            current_remaining = float(bal.get("remaining") or 0)
+            days = float(result.get("days") or 0)
+            advance = max(0.0, days - max(0.0, current_remaining))
+            result["consent_required"] = advance > 0
+            result["consent_advance_days"] = round(advance, 2)
+            result["current_remaining"] = current_remaining
+
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -3719,8 +3860,7 @@ async def list_leaves(personnel_id: Optional[str] = None,
         holidays = await get_all_holidays()
         for L in items:
             try:
-                end_d = date.fromisoformat(L["end_date"])
-                L["isbasi_tarihi"] = _next_working_day(end_d, holidays).isoformat()
+                L["isbasi_tarihi"] = _resolve_isbasi(L, holidays)
             except Exception:
                 L["isbasi_tarihi"] = None
 
@@ -4801,31 +4941,42 @@ async def _upsert_leave(body: LeaveIn, background_tasks: BackgroundTasks, user: 
         })
 
     calc = await calc_leave_days(s, e)
+    # Manuel düzeltme: izin düzenleme ekranından "days_override" gönderilirse
+    # sistemin tarihten hesapladığı değer yerine BU kullanılır (örn. yarım gün
+    # istisnası, hatalı otomatik hesap düzeltmesi vb.). Normal akışta
+    # (days_override gönderilmediğinde) davranış eskisiyle birebir aynıdır.
+    final_days = body.days_override if body.days_override is not None else calc["days"]
+    final_isbasi = body.return_date_override or None
     if existing:
         await db.leaves.update_one({"id": exclude_id}, {"$set": {
             "start_date": body.start_date, "end_date": body.end_date,
-            "days": calc["days"], "izin_turu": body.izin_turu, "aciklama": body.aciklama,
+            "days": final_days, "izin_turu": body.izin_turu, "aciklama": body.aciklama,
+            "isbasi_override": final_isbasi,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "updated_by": user["id"],
         }})
         rec = {**existing, "start_date": body.start_date, "end_date": body.end_date,
-               "days": calc["days"], "izin_turu": body.izin_turu, "aciklama": body.aciklama}
+               "days": final_days, "izin_turu": body.izin_turu, "aciklama": body.aciklama,
+               "isbasi_override": final_isbasi}
         await _audit(action="update", module="leaves", entity_type="leave",
                      entity_id=exclude_id, entity_name=p.get("ad_soyad"),
                      old_values={"start_date": existing.get("start_date"), "end_date": existing.get("end_date"),
                                   "days": existing.get("days"), "izin_turu": existing.get("izin_turu"),
-                                  "aciklama": existing.get("aciklama")},
+                                  "aciklama": existing.get("aciklama"), "isbasi_override": existing.get("isbasi_override")},
                      new_values={"start_date": body.start_date, "end_date": body.end_date,
-                                  "days": calc["days"], "izin_turu": body.izin_turu,
-                                  "aciklama": body.aciklama},
-                     description=f"İzin güncellendi: {p.get('ad_soyad')} — {body.start_date} → {body.end_date}",
+                                  "days": final_days, "izin_turu": body.izin_turu,
+                                  "aciklama": body.aciklama, "isbasi_override": final_isbasi},
+                     description=f"İzin güncellendi: {p.get('ad_soyad')} — {body.start_date} → {body.end_date}"
+                                 + (f" (gün elle {final_days} olarak düzeltildi)" if body.days_override is not None else "")
+                                 + (f" (dönüş tarihi elle {final_isbasi} olarak düzeltildi)" if final_isbasi else ""),
                      request=request, user=user)
         return {**rec, "breakdown": calc["breakdown"], "notified": []}
 
     rec = LeaveRecord(
         personnel_id=body.personnel_id,
         start_date=body.start_date, end_date=body.end_date,
-        days=calc["days"], izin_turu=body.izin_turu, aciklama=body.aciklama,
+        days=final_days, izin_turu=body.izin_turu, aciklama=body.aciklama,
+        isbasi_override=final_isbasi,
         created_by=user["id"],
     )
     await db.leaves.insert_one(rec.model_dump())
@@ -4835,15 +4986,15 @@ async def _upsert_leave(body: LeaveIn, background_tasks: BackgroundTasks, user: 
     if admin_email: recipients.append(admin_email.lower())
     if recipients:
         subject = f"Yıllık İzin Bildirimi — {p['ad_soyad']}"
-        html = f"""<div style="font-family:Arial;padding:20px"><h3>Merkoteks — Yıllık İzin Kaydı</h3><p><b>{p['ad_soyad']}</b> için {body.start_date} → {body.end_date} arası {calc['days']} günlük {body.izin_turu} kaydı oluşturuldu.</p></div>"""
+        html = f"""<div style="font-family:Arial;padding:20px"><h3>Merkoteks — Yıllık İzin Kaydı</h3><p><b>{p['ad_soyad']}</b> için {body.start_date} → {body.end_date} arası {final_days} günlük {body.izin_turu} kaydı oluşturuldu.</p></div>"""
         for r in recipients:
             background_tasks.add_task(_send_email, r, subject, html)
     await _audit(action="create", module="leaves", entity_type="leave",
                  entity_id=rec.id, entity_name=p.get("ad_soyad"),
                  new_values={"start_date": body.start_date, "end_date": body.end_date,
-                              "days": calc["days"], "izin_turu": body.izin_turu,
+                              "days": final_days, "izin_turu": body.izin_turu,
                               "aciklama": body.aciklama, "personnel_id": p["id"]},
-                 description=f"İzin eklendi: {p.get('ad_soyad')} — {body.start_date} → {body.end_date} ({calc['days']} gün)",
+                 description=f"İzin eklendi: {p.get('ad_soyad')} — {body.start_date} → {body.end_date} ({final_days} gün)",
                  request=request, user=user)
     return {**rec.model_dump(), "breakdown": calc["breakdown"], "notified": recipients}
     rec = LeaveRecord(
@@ -5043,8 +5194,12 @@ async def leaves_delete_preview(body: LeavesDeletePreviewIn,
         "items": items,
     }
 
-@api.get("/leaves/{lid}/print")
-async def print_form(lid: str, _: dict = Depends(get_current_user)):
+async def _resolve_leave_consent(lid: str) -> dict:
+    """İzin kaydı için muvafakatname gerekip gerekmediğini ve avans gün sayısını hesaplar.
+    Hem /leaves/{lid}/print (ön izleme metadata'sı) hem de talep-formu.pdf (birleşik
+    PDF üretimi) TEK bu fonksiyonu kullanır — iki yerde ayrı hesap tutup birbirinden
+    sapmasını önlemek için (Iter 66).
+    """
     L = await db.leaves.find_one({"id": lid}, {"_id": 0})
     if not L:
         raise HTTPException(status_code=404, detail="İzin kaydı bulunamadı")
@@ -5059,8 +5214,40 @@ async def print_form(lid: str, _: dict = Depends(get_current_user)):
         or L["start_date"] < (bal.get("last_entitlement_date") or "0000-00-00")
         or zero_day_no_balance
     )
+
+    # Iter 61: Muvafakatname metninde İZNİN TAMAMI DEĞİL, sadece hak edilmemiş
+    # (avans) gün sayısı gösterilmeli. Diğer izinlerle aynı kümülatif yönteme
+    # göre (bkz. consent_advance_days hesaplaması) bu izne özgü avans günü
+    # bulunur: personelin tüm izinleri başlangıç tarihine göre sıralanır,
+    # bu izne kadar önceden kullanılan gün ile o tarihe kadar hak edilen gün
+    # kıyaslanarak sadece bu izne düşen "hak edilmemiş" kısım hesaplanır.
+    consent_advance_days = 0.0
+    if p:
+        pid = L["personnel_id"]
+        ents = []
+        async for e in db.entitlements.find({"personnel_id": pid}, {"_id": 0, "date": 1, "days": 1}):
+            ents.append(e)
+        ents.sort(key=lambda x: x["date"])
+        all_leaves = []
+        async for ol in db.leaves.find({"personnel_id": pid}, {"_id": 0, "id": 1, "start_date": 1, "days": 1}):
+            all_leaves.append(ol)
+        prior_used = 0.0
+        for ol in sorted(all_leaves, key=lambda x: x["start_date"]):
+            entitled_so_far = sum(e["days"] for e in ents if e["date"] <= ol["start_date"])
+            over = (prior_used + float(ol.get("days") or 0)) - entitled_so_far
+            if ol["id"] == lid:
+                consent_advance_days = round(min(float(ol.get("days") or 0), max(0.0, over)), 2)
+                break
+            prior_used += float(ol.get("days") or 0)
+
     return {"leave": L, "personnel": p, "balance": bal, "consent_required": consent_required,
-            "form_meta": {"dokuman_no": "İK.FR.07", "duzenleme_tarihi": "02.01.2023", "revizyon_no": "01"}}
+            "consent_advance_days": consent_advance_days}
+
+
+@api.get("/leaves/{lid}/print")
+async def print_form(lid: str, _: dict = Depends(get_current_user)):
+    info = await _resolve_leave_consent(lid)
+    return {**info, "form_meta": {"dokuman_no": "İK.FR.07", "duzenleme_tarihi": "02.01.2023", "revizyon_no": "01"}}
 
 # -----------------------------------------------------------------------------
 # Holidays
@@ -5134,33 +5321,25 @@ def _classify_holiday(name: str) -> str:
     return "Diğer"
 
 
-@api.post("/holidays/bulk-import-text")
-async def holidays_bulk_import_text(payload: dict, request: Request,
-                                     user: dict = Depends(require_roles("admin", "hr"))):
-    """Yapıştırılan metin (sekme veya tab-boşluk ayraçlı) tatil listesini içe aktarır.
-    Beklenen format: 'TARIH<TAB>TATIL_TANIMI<TAB>GUN_DEGERI' her satırda.
-    Upsert: (date, name) unique. day_value: 1 → 'full', 0.5 / 0,5 → 'half'.
+async def _process_holiday_lines(lines: List[str], source_label: str = "Yüklenen Tatil Listesi",
+                                   force_needs_review: bool = False) -> dict:
+    """'TARIH<TAB>TATIL_TANIMI<TAB>GUN_DEGERI' formatındaki satırları işleyip
+    db.holidays_import'a upsert eder. Hem elle yapıştırılan metin (bulk-import-text)
+    hem de resmi kaynaktan (Diyanet) otomatik çekilen satırlar TEK bu fonksiyondan
+    geçer — iki ayrı yerde farklı davranan kod olmasın diye (Iter 67).
     """
-    text = (payload or {}).get("text", "")
-    filename = (payload or {}).get("filename", "yapistirilan_metin.txt")
-    if not text or not text.strip():
-        raise HTTPException(status_code=400, detail="Boş metin")
-
     total = 0; added = 0; updated = 0; empty_name = 0
     invalid_date = 0; errors: List[dict] = []
     affected_years: set = set()
     seen_pairs: set = set()  # (date_iso, name_lower) — dosya-içi tekrar filtreleme
 
-    for raw_line in text.splitlines():
+    for raw_line in lines:
         line = raw_line.strip()
         if not line: continue
-        # Başlık satırlarını atla
         low = line.lower()
         if ("tarih" in low and "tatil" in low) or low.startswith("sütun"):
             continue
-        # Tab / birden fazla boşluk ile split
-        import re as _re
-        parts = _re.split(r"\t+|\s{2,}", line)
+        parts = re.split(r"\t+|\s{2,}", line)
         if len(parts) < 2:
             continue
         total += 1
@@ -5195,8 +5374,8 @@ async def holidays_bulk_import_text(payload: dict, request: Request,
             "date": iso, "year": d.year, "name": display_name,
             "day_value": 0.5 if h_type == "half" else 1.0,
             "type": h_type, "category": cat,
-            "source": "Yüklenen Tatil Listesi",
-            "active": True, "needs_review": (not name),
+            "source": source_label,
+            "active": True, "needs_review": force_needs_review or (not name),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         existing = await db.holidays_import.find_one(
@@ -5212,19 +5391,171 @@ async def holidays_bulk_import_text(payload: dict, request: Request,
             added += 1
         affected_years.add(d.year)
 
-    result = {
+    return {
         "total_lines": total, "added": added, "updated": updated,
         "duplicates_skipped": total - added - updated - invalid_date,
         "empty_name": empty_name, "invalid_date": invalid_date,
         "error_count": len(errors), "errors": errors[:50],
         "affected_years": sorted(list(affected_years)),
     }
+
+
+# -----------------------------------------------------------------------------
+# Resmi kaynaktan otomatik tatil çekimi — Iter 67
+# takvim.com'un "{yıl}_takvimi.html" sayfaları, o yıla ait TÜM resmi ve dini
+# tatilleri (arife dahil) düz metin listesi olarak yayınlıyor. Bu veri
+# nihayetinde aynı resmi kaynaktan (2429 sayılı Kanun + Diyanet'in dini
+# takvimi) geliyor — takvim.com sadece bunu kolay ayrıştırılabilir, sade bir
+# formatta yeniden yayınlıyor. URL deseni yıl bazlı sabit olduğu için (ör.
+# https://www.takvim.com/2027_takvimi.html) elle güncellenecek bir yıl
+# eşleme listesi TUTULMASINA gerek yok; site en az 2007'den itibaren her yılı
+# kapsıyor.
+# -----------------------------------------------------------------------------
+_TR_MONTH_NAMES = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+                   "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+_TR_MONTH_NUM = {m.lower(): i + 1 for i, m in enumerate(_TR_MONTH_NAMES)}
+# Uzun olan önce denenmeli (ör. "Cumartesi" "Cuma"dan önce), yoksa regex
+# alternation "Cuma"yı erken eşleştirip "rtesi"yi açıklamada bırakır.
+_TR_WEEKDAY_NAMES = ["Pazartesi", "Cumartesi", "Perşembe", "Çarşamba", "Cuma", "Pazar", "Salı"]
+
+
+def _parse_takvim_com_holidays(html_text: str) -> list:
+    """takvim.com'daki '{yıl} YILI RESMİ TATİL GÜNLERİ' düz metin listesini
+    (ör. '1 Ocak 2026 Perşembe Yılbaşı 19 Mart 2026 Perşembe Ramazan Bayramı
+    Arifesi ...') (gün, ay, açıklama) üçlülerine ayırır. HTML etiketlerinden
+    bağımsız, salt metin üzerinde çalıştığı için sitenin tam HTML/tag yapısı
+    değişse bile kırılganlığı düşüktür. Gün ve aydan hemen sonra gelen yıl
+    (ör. '2026') ve/veya gün adı (ör. 'Perşembe') açıklamaya karışmasın diye
+    ayrıştırıldıktan sonra atılır — aksi halde tatil adı '2026 Perşembe
+    Yılbaşı' gibi hatalı görünür.
+    """
+    import html as _html_mod
+    text = re.sub(r"<[^>]+>", " ", html_text)
+    text = _html_mod.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # "RESMİ TATİL GÜNLERİ" başlığından "Not:" / "PDF olarak" ifadesine kadarki
+    # bloğu al — sayfanın geri kalanı (menü, reklam vb.) işimize yaramaz.
+    m = re.search(r"RESM[İI]\s+TAT[İI]L\s+G[ÜU]NLER[İI]\s*(.*?)\s*(?:Not\s*:|PDF olarak|$)",
+                  text, re.IGNORECASE | re.DOTALL)
+    block = m.group(1) if m else text
+
+    months_alt = "|".join(_TR_MONTH_NAMES)
+    weekdays_alt = "|".join(_TR_WEEKDAY_NAMES)
+    token_re = re.compile(
+        rf"(\d{{1,2}})\s+({months_alt})\s+(.*?)(?=\d{{1,2}}\s+(?:{months_alt})\b|$)",
+        re.IGNORECASE | re.DOTALL)
+    # Açıklama başındaki sızmış '2026', 'Perşembe', ': ' / '- ' gibi
+    # parçaları temizlemek için — bunlar gün+ay eşleşmesinin hemen ardından
+    # gelip asıl tatil adının önüne karışıyor.
+    leak_prefix_re = re.compile(
+        rf"^\s*(?:\d{{4}}\s+)?(?:(?:{weekdays_alt})\s*)?[:\-–,]?\s*", re.IGNORECASE)
+
+    entries = []
+    for mm in token_re.finditer(block):
+        day_num = int(mm.group(1))
+        month_num = _TR_MONTH_NUM.get(mm.group(2).lower())
+        desc = mm.group(3).strip(" .")
+        desc = leak_prefix_re.sub("", desc).strip(" .:-–")
+        if not month_num or not desc:
+            continue
+        entries.append((day_num, month_num, desc))
+    return entries
+
+
+def _takvim_com_entries_to_lines(entries: list, year: int) -> list:
+    """(gün, ay, açıklama) üçlülerini _process_holiday_lines'ın beklediği
+    'DD.MM.YYYY<TAB>İsim<TAB>GünDeğeri' satırlarına çevirir. takvim.com arife
+    günlerini zaten kendi ayrı satırında verdiği için (örn. '8 Mart Ramazan
+    Bayramı Arifesi'), ekstra bölme mantığına gerek yok — sadece açıklamada
+    'aref' geçiyorsa yarım gün (0,5) kabul edilir."""
+    lines = []
+    for day_num, month_num, desc in entries:
+        # "1.gün" / "2. gün" gibi sıra etiketlerini "1. Gün" şeklinde düzelt (kozmetik)
+        desc = re.sub(r"(\d)\s*\.\s*g[üu]n", lambda g: f"{g.group(1)}. Gün", desc, flags=re.IGNORECASE)
+        is_half = ("aref" in desc.lower()) or ("arife" in desc.lower())
+        val_str = "0,5" if is_half else "1"
+        lines.append(f"{day_num:02d}.{month_num:02d}.{year}\t{desc}\t{val_str}")
+    return lines
+
+
+@api.post("/holidays/fetch-official")
+async def holidays_fetch_official(year: int, request: Request,
+                                    user: dict = Depends(require_roles("admin", "hr"))):
+    """Belirtilen yılın resmi ve dini tatillerini takvim.com üzerinden otomatik
+    çeker ve içe aktarır. Bu veri, Türkiye'deki resmi tatilleri belirleyen
+    2429 sayılı Kanun ve Diyanet'in dini gün takviminden geliyor — takvim.com
+    sadece bunu kolay ayrıştırılabilir bir formatta sunuyor. Yeni bir
+    ayrıştırma mekanizması olduğu için, bir kere admin gözünden geçsin diye
+    içe aktarılan tüm kayıtlar 'Kontrol Gerekli' olarak işaretlenir.
+    """
+    url = f"https://www.takvim.com/{year}_takvimi.html"
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 404:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{year} yılı için takvim.com'da henüz bir sayfa yok "
+                           f"(genellikle 2007 ve sonrası desteklenir). "
+                           f"Bu yıl için Excel/metin ile manuel ekleyin."
+                )
+            r.raise_for_status()
+            html_text = r.text
+    except HTTPException:
+        raise
+    except Exception as ex:
+        log.error("takvim.com tatil sayfası çekilemedi: %s", ex)
+        raise HTTPException(status_code=502,
+                             detail="Resmi kaynağa şu anda ulaşılamıyor. "
+                                    "Daha sonra tekrar deneyin veya manuel ekleyin.")
+
+    entries = _parse_takvim_com_holidays(html_text)
+    if not entries:
+        raise HTTPException(status_code=502,
+                             detail="Sayfa alındı ama tatil listesi ayrıştırılamadı "
+                                    "(site yapısı değişmiş olabilir). Lütfen manuel ekleyin.")
+
+    lines = _takvim_com_entries_to_lines(entries, year)
+    result = await _process_holiday_lines(
+        lines,
+        source_label=f"Resmi Tatil Takvimi (Otomatik) — {url}",
+        force_needs_review=True,
+    )
+    result["source"] = "takvim.com (Resmi Tatil Takvimi)"
+    result["source_url"] = url
+
     await _audit(
         action="bulk_import", module="holidays", entity_type="holiday",
-        entity_id=None, entity_name=f"Tatil aktarım: {added}+{updated}",
+        entity_id=None, entity_name=f"{year} — Otomatik tatil çekimi",
+        new_values={"year": year, **{k: v for k, v in result.items() if k != "errors"}},
+        description=f"{year} yılı resmi tatilleri takvim.com'dan otomatik çekildi: "
+                     f"+{result['added']} yeni, ~{result['updated']} güncel",
+        request=request, user=user,
+    )
+    return result
+
+
+@api.post("/holidays/bulk-import-text")
+async def holidays_bulk_import_text(payload: dict, request: Request,
+                                     user: dict = Depends(require_roles("admin", "hr"))):
+    """Yapıştırılan metin (sekme veya tab-boşluk ayraçlı) tatil listesini içe aktarır.
+    Beklenen format: 'TARIH<TAB>TATIL_TANIMI<TAB>GUN_DEGERI' her satırda.
+    Upsert: (date, name) unique. day_value: 1 → 'full', 0.5 / 0,5 → 'half'.
+    """
+    text = (payload or {}).get("text", "")
+    filename = (payload or {}).get("filename", "yapistirilan_metin.txt")
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Boş metin")
+
+    result = await _process_holiday_lines(text.splitlines())
+
+    await _audit(
+        action="bulk_import", module="holidays", entity_type="holiday",
+        entity_id=None, entity_name=f"Tatil aktarım: {result['added']}+{result['updated']}",
         new_values={"filename": filename, **{k: v for k, v in result.items() if k != "errors"}},
-        description=f"Tatil listesi içe aktarıldı: +{added} yeni, ~{updated} güncel, "
-                    f"{invalid_date} geçersiz tarih, yıllar: {result['affected_years']}",
+        description=f"Tatil listesi içe aktarıldı: +{result['added']} yeni, ~{result['updated']} güncel, "
+                    f"{result['invalid_date']} geçersiz tarih, yıllar: {result['affected_years']}",
         request=request, user=user,
     )
     return result
@@ -5304,6 +5635,84 @@ async def set_notification_settings(body: dict, request: Request,
                  description="HR uyarı e-postası güncellendi",
                  request=request, user=user)
     return {"ok": True, "hr_alert_email": email}
+
+
+# -----------------------------------------------------------------------------
+# Kurumsal Logo (Ayarlar → Logo Ekle) — Iter 65
+# İzin Talep Formu'nun sol üst köşesinde firma adı yerine gösterilir. Sadece
+# admin ekleyip değiştirebilir/kaldırabilir; herkes görüntüleyebilir.
+# -----------------------------------------------------------------------------
+@api.get("/settings/branding")
+async def get_branding_settings(_: dict = Depends(get_current_user)):
+    doc = await db.app_settings.find_one({"_id": "branding"})
+    has_logo = bool((doc or {}).get("logo_object_path"))
+    return {
+        "has_logo": has_logo,
+        "updated_at": (doc or {}).get("updated_at"),
+        "logo_url": "/api/settings/branding/logo" if has_logo else None,
+    }
+
+
+@api.get("/settings/branding/logo")
+async def get_branding_logo(_: dict = Depends(get_current_user)):
+    doc = await db.app_settings.find_one({"_id": "branding"})
+    obj_path = (doc or {}).get("logo_object_path")
+    if not obj_path:
+        raise HTTPException(status_code=404, detail="Kayıtlı logo yok")
+    data, content_type = await _get_object(obj_path)
+    return StreamingResponse(io.BytesIO(data), media_type=content_type or "image/png")
+
+
+@api.post("/settings/branding/logo")
+async def upload_branding_logo(request: Request, file: UploadFile = File(...),
+                                user: dict = Depends(require_roles("admin"))):
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _LOGO_ALLOWED_EXT:
+        raise HTTPException(status_code=400, detail="Sadece PNG, JPG, JPEG veya WEBP yükleyebilirsiniz")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Dosya boş")
+    if len(data) > _LOGO_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="Logo dosyası 3 MB'tan küçük olmalı")
+    try:
+        from PIL import Image as PILImage
+        PILImage.open(io.BytesIO(data)).verify()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Dosya geçerli bir görsel değil")
+
+    prev = await db.app_settings.find_one({"_id": "branding"})
+    obj_path = f"branding/company_logo{ext}"
+    await _put_object(obj_path, data, file.content_type or "image/png")
+
+    await db.app_settings.update_one(
+        {"_id": "branding"},
+        {"$set": {"logo_object_path": obj_path,
+                  "updated_at": datetime.now(timezone.utc).isoformat(),
+                  "updated_by": user.get("id")}},
+        upsert=True,
+    )
+    await _audit(action="update", module="settings",
+                 entity_type="settings", entity_id="branding",
+                 entity_name="Kurumsal Logo",
+                 old_values={"logo_object_path": (prev or {}).get("logo_object_path")},
+                 new_values={"logo_object_path": obj_path},
+                 description="Kurumsal logo yüklendi/değiştirildi — İzin Talep Formu'nda gösterilecek",
+                 request=request, user=user)
+    return {"ok": True, "logo_url": "/api/settings/branding/logo"}
+
+
+@api.delete("/settings/branding/logo")
+async def delete_branding_logo(request: Request, user: dict = Depends(require_roles("admin"))):
+    prev = await db.app_settings.find_one({"_id": "branding"})
+    await db.app_settings.update_one({"_id": "branding"}, {"$unset": {"logo_object_path": ""}})
+    await _audit(action="delete", module="settings",
+                 entity_type="settings", entity_id="branding",
+                 entity_name="Kurumsal Logo",
+                 old_values={"logo_object_path": (prev or {}).get("logo_object_path")},
+                 new_values={},
+                 description="Kurumsal logo kaldırıldı — form eski sabit metne döndü",
+                 request=request, user=user)
+    return {"ok": True}
 
 
 # -----------------------------------------------------------------------------
@@ -6057,6 +6466,10 @@ class SyncApplyIn(BaseModel):
     terminate_reason: str = "Güncel personel listesinde bulunmuyor"
     # Iter 44: satır bazlı özel işten çıkış tarihleri {personnel_id: "YYYY-MM-DD"}
     terminate_overrides: Dict[str, str] = {}
+    # ZKAccess gibi sadece ad/soyad/sicil veren kaynaklardan gelen new_rows
+    # için True gönderilir — oluşturulan personel "needs_completion=True"
+    # ile işaretlenir (detay sayfasında "bilgileri tamamlayın" uyarısı).
+    mark_needs_completion: bool = False
 
 
 @api.post("/personnel/sync/apply")
@@ -6088,6 +6501,7 @@ async def personnel_sync_apply(body: SyncApplyIn, request: Request,
                 departman=r.get("departman", ""), gorev="",
                 sirket=r.get("sirket", ""), aktif=True,
                 onceki_kidem_yil=kidem, telefon="", email="", aciklama="",
+                needs_completion=body.mark_needs_completion,
             ).model_dump()
             await db.personnel.insert_one(doc)
             created += 1
@@ -6855,6 +7269,112 @@ async def export_leaves_range(start: str, end: str, format: str = "xlsx",
 # -----------------------------------------------------------------------------
 TEMPLATE_PATH = ROOT_DIR / "templates" / "izin_template.xlsm"
 
+# -----------------------------------------------------------------------------
+# Kurumsal Logo (Ayarlar → Logo Ekle) — Iter 65
+# İzin Talep Formu'nun sol üst köşesindeki "MERKOTEKS TEKSTİL SAN. VE TİC. A.Ş."
+# metninin yerine, admin tarafından yüklenen logo görseli konur. Logo yoksa
+# (hiç yüklenmemişse veya kaldırılmışsa) eski davranışa — sabit metne — döner.
+# İleride çoklu şirket desteğine geçilirse, "logo_object_path" tek bir global
+# alan yerine personel.sirket bazlı bir sözlüğe taşınabilir (db.app_settings
+# şeması buna uygun genişletilebilir).
+# -----------------------------------------------------------------------------
+_LOGO_ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+_LOGO_MAX_BYTES = 3 * 1024 * 1024  # 3 MB
+
+
+async def _get_company_logo_bytes() -> Optional[bytes]:
+    """Kayıtlı kurumsal logo varsa ham görsel byte'larını döndürür, yoksa None."""
+    doc = await db.app_settings.find_one({"_id": "branding"})
+    obj_path = (doc or {}).get("logo_object_path")
+    if not obj_path:
+        return None
+    try:
+        data, _ct = await _get_object(obj_path)
+        return data
+    except HTTPException:
+        return None
+
+
+def _excel_col_width_to_px(width) -> float:
+    """openpyxl kolon genişliği (karakter birimi, Calibri 11) → piksel (yaklaşık)."""
+    if width is None:
+        width = 8.43  # Excel varsayılan kolon genişliği
+    return round(width * 7 + 5)
+
+
+def _excel_row_height_to_px(height) -> float:
+    """openpyxl satır yüksekliği (punto) → piksel (96 DPI varsayımıyla)."""
+    if height is None:
+        height = 15  # Excel varsayılan satır yüksekliği (Calibri 11)
+    return round(height * 96 / 72)
+
+
+def _merged_box_px(ws, anchor_cell: str = "A1") -> tuple:
+    """anchor_cell'i içeren birleştirilmiş hücre aralığının piksel genişlik/
+    yükseklik değerini ve (min_row, min_col) konumunu döndürür. Hücre
+    birleştirilmemişse tek hücrenin boyutunu döndürür.
+    """
+    from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
+    from openpyxl.utils import get_column_letter
+
+    min_col = min_row = max_col = max_row = None
+    for mc in ws.merged_cells.ranges:
+        if anchor_cell in mc:
+            min_col, min_row, max_col, max_row = mc.min_col, mc.min_row, mc.max_col, mc.max_row
+            break
+    if min_col is None:
+        col_letter, row_idx = coordinate_from_string(anchor_cell)
+        min_col = max_col = column_index_from_string(col_letter)
+        min_row = max_row = row_idx
+
+    width_px = 0.0
+    for c in range(min_col, max_col + 1):
+        col_letter = get_column_letter(c)
+        dim = ws.column_dimensions.get(col_letter)
+        width_px += _excel_col_width_to_px(dim.width if dim else None)
+
+    height_px = 0.0
+    for r in range(min_row, max_row + 1):
+        dim = ws.row_dimensions.get(r)
+        height_px += _excel_row_height_to_px(dim.height if dim else None)
+
+    return width_px, height_px, (min_row, min_col)
+
+
+def _insert_logo_image(ws, logo_bytes: bytes, anchor_cell: str = "A1", padding_px: int = 4) -> None:
+    """Logoyu hedef hücrenin (birleştirilmişse tüm aralığın) piksel boyutuna
+    en/boy oranını koruyarak sığdırır ve hücre içinde ortalar.
+    """
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
+    from openpyxl.drawing.xdr import XDRPositiveSize2D
+    from openpyxl.utils.units import pixels_to_EMU
+    from PIL import Image as PILImage
+
+    box_w_px, box_h_px, (min_row, min_col) = _merged_box_px(ws, anchor_cell)
+    if box_w_px <= 0 or box_h_px <= 0:
+        box_w_px, box_h_px = 160, 60  # emniyet varsayılanı
+
+    pil_img = PILImage.open(io.BytesIO(logo_bytes))
+    src_w, src_h = pil_img.size
+    avail_w = max(box_w_px - 2 * padding_px, 10)
+    avail_h = max(box_h_px - 2 * padding_px, 10)
+    scale = min(avail_w / src_w, avail_h / src_h)
+    disp_w = max(int(src_w * scale), 1)
+    disp_h = max(int(src_h * scale), 1)
+
+    img = XLImage(io.BytesIO(logo_bytes))
+    img.width = disp_w
+    img.height = disp_h
+
+    off_x = pixels_to_EMU(max((box_w_px - disp_w) / 2, 0))
+    off_y = pixels_to_EMU(max((box_h_px - disp_h) / 2, 0))
+    marker = AnchorMarker(col=min_col - 1, row=min_row - 1, colOff=int(off_x), rowOff=int(off_y))
+    size = XDRPositiveSize2D(pixels_to_EMU(disp_w), pixels_to_EMU(disp_h))
+    img.anchor = OneCellAnchor(_from=marker, ext=size)
+
+    ws.add_image(img)
+
 def _keep_only_sheets(wb, keep_visible: str, keep_ref: list = None):
     """Hedef sayfa dışındakileri workbook'tan sil. Formül referansları için gerekli sayfaları gizli tut."""
     keep_ref = keep_ref or []
@@ -6870,6 +7390,161 @@ def _keep_only_sheets(wb, keep_visible: str, keep_ref: list = None):
     if keep_visible in wb.sheetnames:
         wb[keep_visible].sheet_state = "visible"
         wb.active = wb.sheetnames.index(keep_visible)
+
+
+# -----------------------------------------------------------------------------
+# Muvafakatname PDF üretimi + PDF birleştirme (Iter 66)
+# Önceden İzin Talep Formu (PDF, LibreOffice ile üretiliyor) ile Muvafakatname
+# (frontend'de ayrı bir HTML bloğu olarak) TARAYICIDA window.print() ile
+# "birleşik" yazdırılmaya çalışılıyordu — bu, PDF içeren bir <iframe>'in
+# tarayıcının kendi PDF görüntüleyicisiyle render edilmesi yüzünden güvenilir
+# değildi (bazı tarayıcılarda iframe içeriği yazdırmaya dahil olmuyordu).
+# Artık muvafakatname de PDF olarak üretilip talep formunun PDF'ine
+# EKLENİYOR — tek, gerçek bir PDF dosyası indiriliyor/önizleniyor, bu yüzden
+# yazdırma davranışı tarayıcıdan bağımsız ve güvenilir.
+# -----------------------------------------------------------------------------
+
+# ÖNEMLİ: reportlab'in dahili "Times-Roman" fontu (WinAnsiEncoding) Türkçe'ye
+# özgü karakterleri (İ, ı, ş, ğ, Ş, Ğ, Ç, Ö, Ü'nün bazı glyph'leri) İÇERMEZ —
+# bu karakterler PDF'te SİYAH KUTU olarak basılır. Bu yüzden sistemde bulunan
+# gerçek bir TrueType font kayıt edilir (Times New Roman'a görsel olarak en
+# yakın, Türkçe destekli seçenek: Liberation Serif; bulunamazsa DejaVu Serif).
+_MUVAFAKAT_FONT_CANDIDATES = [
+    ("LiberationSerif",
+     "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+     "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"),
+    ("DejaVuSerif",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"),
+    ("NotoSerif",
+     "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
+     "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"),
+]
+_muvafakat_font_cache = None  # (normal_font_adi, bold_font_adi) veya False
+
+
+def _ensure_turkish_font():
+    """Türkçe karakterleri doğru basan bir TrueType fontu reportlab'e kayıt
+    eder ve (normal, bold) font adlarını döner. Hiçbir aday font sistemde
+    bulunamazsa False döner (bu durumda çağıran taraf eski — hatalı —
+    Times-Roman'a düşer, ama en azından PDF üretimi çökmez)."""
+    global _muvafakat_font_cache
+    if _muvafakat_font_cache is not None:
+        return _muvafakat_font_cache
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    for name, reg_path, bold_path in _MUVAFAKAT_FONT_CANDIDATES:
+        if os.path.exists(reg_path) and os.path.exists(bold_path):
+            try:
+                pdfmetrics.registerFont(TTFont(name, reg_path))
+                pdfmetrics.registerFont(TTFont(f"{name}-Bold", bold_path))
+                _muvafakat_font_cache = (name, f"{name}-Bold")
+                return _muvafakat_font_cache
+            except Exception as ex:
+                log.warning("Font kayıt edilemedi (%s): %s", name, ex)
+                continue
+    log.warning("Türkçe destekli TrueType font bulunamadı — Muvafakatname PDF'inde "
+                "İ/ı/ş/ğ gibi karakterler yanlış basılabilir. Liberation Serif veya "
+                "DejaVu Serif fontlarının image'a kurulu olduğundan emin olun "
+                "(örn. Dockerfile'a `apt-get install -y fonts-liberation` ekleyin).")
+    _muvafakat_font_cache = False
+    return False
+
+
+def _build_muvafakatname_pdf(personnel: dict, leave: dict, consent_advance_days: float,
+                              next_entitlement_date: Optional[str]) -> bytes:
+    """LeavePrint.jsx'teki muvafakatname metniyle birebir aynı içerikte, A4 tek
+    sayfalık bir PDF üretir (talep formu PDF'inin arkasına eklenmek üzere)."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+
+    fonts = _ensure_turkish_font()
+    font_normal, font_bold = fonts if fonts else ("Times-Roman", "Times-Bold")
+
+    def _d(iso: Optional[str]):
+        if not iso:
+            return None
+        try:
+            return datetime.fromisoformat(iso[:10]).date()
+        except Exception:
+            return None
+
+    def _tr(iso: Optional[str]) -> str:
+        d = _d(iso)
+        return d.strftime("%d.%m.%Y") if d else "—"
+
+    def _days_tr(n) -> str:
+        if n is None:
+            return "—"
+        s = f"{float(n):g}".replace(".", ",")
+        return f"{s} günlük"
+
+    ise_giris = _tr(personnel.get("ise_giris"))
+    izin_bas = _tr(leave.get("start_date"))
+    hak_edis = _tr(next_entitlement_date)
+    gun_str = _days_tr(consent_advance_days)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                             topMargin=32 * mm, bottomMargin=25 * mm,
+                             leftMargin=25 * mm, rightMargin=25 * mm)
+    title_style = ParagraphStyle("title", fontName=font_bold, fontSize=20,
+                                  alignment=TA_CENTER, leading=24, spaceAfter=30)
+    body_style = ParagraphStyle("body", fontName=font_normal, fontSize=12,
+                                 alignment=TA_JUSTIFY, leading=20,
+                                 firstLineIndent=28, spaceAfter=16)
+    sig_style = ParagraphStyle("sig", fontName=font_normal, fontSize=12, leading=22)
+    # Paragraph içindeki <b> etiketleri de bold varyantı kullanabilsin diye
+    body_style.fontName = font_normal
+    sig_style.fontName = font_normal
+
+    def _b(text: str) -> str:
+        return f'<font name="{font_bold}">{text}</font>'
+
+    story = [
+        Paragraph("MUVAFAKATNAME", title_style),
+        Paragraph(
+            f"MERKOTEKS TEKSTİL SAN. VE TİC. A.Ş. unvanlı işyerinde "
+            f"{_b(personnel.get('tc_no') or '—')} T.C. Kimlik numarası ile "
+            f"{_b(ise_giris)} tarihinden bu yana "
+            f"{_b(personnel.get('departman') or '—')} departmanında çalışmaktayım.",
+            body_style),
+        Paragraph(
+            f"İşverenlikten henüz yıllık ücretli izne hak kazanmamama rağmen "
+            f"{_b(izin_bas)} tarihinden itibaren {_b(gun_str)} yıllık izin talep etmekteyim.",
+            body_style),
+        Paragraph(
+            f"Yıllık ücretli izne hak kazanacağım {_b(hak_edis)} tarihinden önce işyerinden "
+            f"ayrılmam söz konusu olursa, hak etmeden kullandığım {_b(gun_str)} izne ait "
+            f"ücretin işten ayrılış sürecimde hak etmiş olduğum son ücretimden düşülmesine "
+            f"onay veriyorum.",
+            body_style),
+        Spacer(1, 40 * mm),
+        Paragraph(f"ADI SOYADI : {_b(personnel.get('ad_soyad', '—'))}", sig_style),
+        Spacer(1, 5 * mm),
+        Paragraph("İMZA          :", sig_style),
+    ]
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _merge_pdfs(pdf_byte_list: list) -> bytes:
+    """Birden fazla PDF'i (byte listesi) sırasıyla tek bir PDF'te birleştirir."""
+    from pypdf import PdfReader, PdfWriter
+    writer = PdfWriter()
+    for data in pdf_byte_list:
+        reader = PdfReader(io.BytesIO(data))
+        for page in reader.pages:
+            writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.getvalue()
+
 
 async def _fill_talep_formu(personnel: dict, leave: dict, hak_edis_tarihi: Optional[str] = None,
                               talep_tarihi_iso: Optional[str] = None) -> bytes:
@@ -6892,10 +7567,16 @@ async def _fill_talep_formu(personnel: dict, leave: dict, hak_edis_tarihi: Optio
         d = _d(iso)
         return d.strftime("%d.%m.%Y") if d else ""
 
-    # A1: şirket adı ile #VALUE! hatasını değiştir
-    ws["A1"] = "MERKOTEKS TEKSTİL SAN. VE TİC. A.Ş."
-    ws["A1"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws["A1"].font = Font(bold=True, size=9)
+    # A1: admin tarafından logo yüklendiyse görsel, yüklenmediyse eski sabit metin
+    # (böylece #VALUE! hatası da her durumda temizlenmiş olur)
+    logo_bytes = await _get_company_logo_bytes()
+    if logo_bytes:
+        ws["A1"] = None
+        _insert_logo_image(ws, logo_bytes, anchor_cell="A1")
+    else:
+        ws["A1"] = "MERKOTEKS TEKSTİL SAN. VE TİC. A.Ş."
+        ws["A1"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws["A1"].font = Font(bold=True, size=9)
 
     # Doküman meta — Düzenleme Tarihi (H2) GG.AA.YYYY formatı
     ws["H2"] = _dt(2023, 1, 2).date()
@@ -6947,7 +7628,8 @@ async def _fill_talep_formu(personnel: dict, leave: dict, hak_edis_tarihi: Optio
 
     # B20 DÜŞÜNCE VE ONAY — gerçek tarihler
     holidays_map = await get_all_holidays()
-    isbasi = _next_working_day(izin_bit, holidays_map) if izin_bit else None
+    _isbasi_str = _resolve_isbasi(leave, holidays_map)
+    isbasi = _d(_isbasi_str) if _isbasi_str else None
     if izin_bas and izin_bit and isbasi:
         ws["B20"] = (
             f"        Kimliği yukarıda yer alan personelimizin, yıllık ücretli izin hakkını "
@@ -7052,6 +7734,19 @@ async def _fill_izin_cetveli(personnel: dict, allocations: list) -> bytes:
     total = len(sorted_allocs)
     template_slots = 12
 
+    # Iter 42: Sayfa başına HER ZAMAN 12 satır — imza atmaya rahat yer bırakmak
+    # için satır yüksekliği büyütüldü. TEK bir sabit değer (ROW_HEIGHT_PT) —
+    # PDF çıktısında satırlar sayfayı tam doldurmuyorsa bu sayıyı artırın
+    # (ör. 44 -> 50), sonraki sayfaya taşıyorsa azaltın (ör. 44 -> 38) ve
+    # backend'i yeniden build edin. LibreOffice'in "sayfaya sığdır" ölçeklemesi
+    # render'a göre değişebildiği için kesin punto hesabı yerine tek ayarlanabilir
+    # sabit kullanılıyor.
+    ROW_HEIGHT_PT = 44.0
+    per_row_pt = ROW_HEIGHT_PT
+
+    for r in range(9, 21):
+        ws.row_dimensions[r].height = per_row_pt
+
     # 12'den fazlaysa ek satırları row 20'nin stilini kopyalayarak ekle
     if total > template_slots:
         extra = total - template_slots
@@ -7069,12 +7764,15 @@ async def _fill_izin_cetveli(personnel: dict, allocations: list) -> bytes:
                     dst.alignment = copy(src.alignment)
                     dst.number_format = src.number_format
                     dst.fill = default_fill
-        # Satır yüksekliğini row 20'den al
-        h20 = ws.row_dimensions[template_row_r].height
-        for i in range(extra):
-            new_r = 21 + i
-            if h20:
-                ws.row_dimensions[new_r].height = h20
+            ws.row_dimensions[new_r].height = per_row_pt
+
+        # Manuel sayfa sonları: HER 12 satırda bir yeni sayfa (son sayfa hariç)
+        from openpyxl.worksheet.pagebreak import Break
+        k = 1
+        while template_slots * k < total:
+            break_row = 8 + template_slots * k  # 20, 32, 44, ...
+            ws.row_breaks.append(Break(id=break_row))
+            k += 1
 
     for i, a in enumerate(sorted_allocs):
         r = 9 + i
@@ -7159,22 +7857,87 @@ async def _fill_izin_cetveli(personnel: dict, allocations: list) -> bytes:
     wb.save(buf); buf.seek(0)
     return buf.getvalue()
 
+# --- LibreOffice performans: kalıcı "dinleyici" süreç ------------------------
+# Sorun: eski yöntem her PDF isteğinde `soffice --convert-to ...` ile
+# LibreOffice'i SIFIRDAN açıyordu — bu, her seferinde 3-8 saniye gecikmeye
+# yol açıyordu (İzin Cetveli, İzin Talep Formu, Muvafakatname'nin hepsi
+# yavaş hissediliyordu, 11.09.2026'da bildirildi).
+# Çözüm: backend başladığında LibreOffice'i arka planda AÇIK TUTAN bir
+# "dinleyici" süreç başlatılır; sonraki dönüştürmeler `unoconv` ile bu zaten
+# açık sürece bağlanır — soğuk başlatma maliyeti bir kereye iner.
+# `unoconv` kurulu değilse (henüz Dockerfile'a eklenmediyse) hiçbir şey
+# bozulmaz, otomatik olarak eski (yavaş ama garanti çalışan) yönteme döner.
+_LIBREOFFICE_LISTENER_PORT = 2002
+_libreoffice_listener_proc = None
+
+
+def _ensure_libreoffice_listener():
+    global _libreoffice_listener_proc
+    import subprocess, shutil, socket
+    if _libreoffice_listener_proc and _libreoffice_listener_proc.poll() is None:
+        return  # bu worker zaten kendi dinleyicisini başlatmış
+    # Backend birden fazla uvicorn worker'ıyla çalışıyor (bkz. Dockerfile
+    # CMD --workers 2) — her worker ayrı bir Python süreci olduğu için
+    # startup event'i HER worker'da tekrar tetiklenir. Port zaten dinleniyorsa
+    # (başka bir worker önce başlatmışsa) tekrar spawn ETMEYİZ, aksi halde
+    # ikinci soffice süreci portu bağlayamayıp boşuna kaynak tüketir.
+    try:
+        with socket.create_connection(("127.0.0.1", _LIBREOFFICE_LISTENER_PORT), timeout=0.5):
+            log.info("LibreOffice dinleyicisi zaten başka bir worker tarafından açılmış, atlanıyor.")
+            return
+    except OSError:
+        pass  # port boş — bu worker başlatsın
+    soffice = shutil.which("libreoffice") or shutil.which("soffice")
+    if not soffice:
+        return
+    try:
+        _libreoffice_listener_proc = subprocess.Popen(
+            [soffice, "--headless", "--invisible", "--nocrashreport", "--nodefault",
+             "--nofirststartwizard", "--nologo", "--norestore",
+             f"--accept=socket,host=127.0.0.1,port={_LIBREOFFICE_LISTENER_PORT};urp;"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        log.info("LibreOffice dinleyicisi başlatıldı (port %d) — PDF dönüştürme hızlanacak.",
+                  _LIBREOFFICE_LISTENER_PORT)
+    except Exception:
+        log.exception("LibreOffice dinleyicisi başlatılamadı — PDF dönüştürme eski (yavaş) "
+                       "yöntemle devam edecek, işlevsellik bozulmaz.")
+
+
 def _xlsx_to_pdf(xlsx_bytes: bytes, sheet_name: str) -> Optional[bytes]:
-    """LibreOffice headless ile XLSX → PDF. Sadece hedef (gizli olmayan) sayfa render edilir."""
+    """XLSX → PDF. Önce hızlı yolu (unoconv + kalıcı LibreOffice dinleyicisi)
+    dener; o başarısız olursa (örn. unoconv kurulu değilse) otomatik olarak
+    eski, her zaman çalışan `soffice --convert-to` yöntemine döner."""
     import subprocess, tempfile, shutil
     soffice = shutil.which("libreoffice") or shutil.which("soffice")
     if not soffice:
         return None
-    # Filtre: ExportHiddenSheets=false → gizli sayfalar PDF'e alınmaz
-    pdf_filter = (
-        'pdf:calc_pdf_Export:{'
-        '"ExportHiddenSheets":{"type":"boolean","value":"false"},'
-        '"SinglePageSheets":{"type":"boolean","value":"false"}'
-        '}'
-    )
+    unoconv = shutil.which("unoconv")
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "doc.xlsx"
         src.write_bytes(xlsx_bytes)
+
+        if unoconv:
+            try:
+                _ensure_libreoffice_listener()
+                subprocess.run(
+                    [unoconv, "-f", "pdf", "--server=127.0.0.1",
+                     "-p", str(_LIBREOFFICE_LISTENER_PORT), str(src)],
+                    check=True, capture_output=True, timeout=30,
+                )
+                pdf = Path(tmp) / "doc.pdf"
+                if pdf.exists():
+                    return pdf.read_bytes()
+            except Exception as e:
+                log.warning("unoconv (hızlı yol) başarısız oldu, yavaş yönteme dönülüyor: %s", e)
+
+        # Yedek (eski, garanti çalışan) yöntem — her istekte soğuk başlatma yapar.
+        pdf_filter = (
+            'pdf:calc_pdf_Export:{'
+            '"ExportHiddenSheets":{"type":"boolean","value":"false"},'
+            '"SinglePageSheets":{"type":"boolean","value":"false"}'
+            '}'
+        )
         try:
             subprocess.run(
                 [soffice, "--headless", "--calc",
@@ -7235,16 +7998,25 @@ async def leave_form_xlsx(lid: str, _: dict = Depends(get_current_user)):
 
 @api.get("/leaves/{lid}/talep-formu.pdf")
 async def leave_form_pdf(lid: str, _: dict = Depends(get_current_user)):
-    L = await db.leaves.find_one({"id": lid}, {"_id": 0})
-    if not L: raise HTTPException(status_code=404, detail="İzin bulunamadı")
-    p = await db.personnel.find_one({"id": L["personnel_id"]}, {"_id": 0})
-    if not p: raise HTTPException(status_code=404, detail="Personel bulunamadı")
+    info = await _resolve_leave_consent(lid)
+    L, p = info["leave"], info["personnel"]
+    if not p:
+        raise HTTPException(status_code=404, detail="Personel bulunamadı")
     hak_edis = await _resolve_hak_edis_for_leave(p, L)
     xlsx = await _fill_talep_formu(p, L, hak_edis_tarihi=hak_edis,
                                      talep_tarihi_iso=L.get("created_at"))
     pdf = _xlsx_to_pdf(xlsx, "İZİN TALEP FORMU")
     if pdf is None:
         raise HTTPException(status_code=503, detail="PDF dönüştürücü (LibreOffice) yüklenmedi. Şimdilik Excel çıktısını kullanın.")
+
+    # Iter 66: Muvafakatname gerekiyorsa, ayrı bir PDF sayfası olarak üretilip
+    # talep formunun arkasına eklenir — böylece tek, gerçek bir PDF içinde
+    # ikisi birden gelir ve "Yazdır" tarayıcıdan bağımsız güvenilir çalışır.
+    if info["consent_required"]:
+        next_ent_date = ((info.get("balance") or {}).get("next_entitlement") or {}).get("date")
+        muvafakat_pdf = _build_muvafakatname_pdf(p, L, info["consent_advance_days"], next_ent_date)
+        pdf = _merge_pdfs([pdf, muvafakat_pdf])
+
     return _stream(pdf, f"izin_talep_{p.get('sicil_no','')}.pdf", "application/pdf")
 
 @api.post("/admin/recompute-leave-days")

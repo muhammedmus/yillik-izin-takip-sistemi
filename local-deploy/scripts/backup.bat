@@ -1,8 +1,14 @@
 @echo off
 REM ============================================================================
-REM Yillik Izin Takip Sistemi - BACKUP v3
+REM Yillik Izin Takip Sistemi - BACKUP v4
 REM Locale-independent + robust + SHA256
 REM Cikti: %DATA_DIR%\backup\YYYY-MM-DD_HHMMSS\
+REM
+REM NOT (v4): Yillik izin Excel/CSV/TXT disa aktarim adimi kaldirildi. Bu ihtiyac
+REM artik ayri bir script (daily_leave_log.bat) tarafindan, "Guncel_Yillik_Izin.xlsx"
+REM ve "gunluk_izinler\" klasoru olarak, daha uygun formatta karsilaniyor.
+REM Bu script artik yalnizca gercek felaket-kurtarma yedegine (MongoDB + uploads)
+REM odaklaniyor.
 REM ============================================================================
 
 setlocal enabledelayedexpansion
@@ -66,15 +72,8 @@ REM Baslangic durumlari
 REM ============================================================================
 set "MONGO_OK=FAIL"
 set "UPLOADS_OK=FAIL"
-set "EXPORT_OK=FAIL"
 set "MANIFEST_OK=FAIL"
 set "SHA_OK=FAIL"
-set "LATEST_OK=FAIL"
-
-set "MONGO_COUNT=0"
-set "EXCEL_COUNT=0"
-set "CSV_COUNT=0"
-set "COUNTS_MATCH=NO"
 
 set "MONGO_SIZE=0"
 set "UPLOADS_FILES=0"
@@ -82,7 +81,7 @@ set "UPLOADS_FILES=0"
 REM ============================================================================
 REM 1) MongoDB dump
 REM ============================================================================
-echo [1/7] MongoDB dump aliniyor...
+echo [1/5] MongoDB dump aliniyor...
 
 docker exec merkoteks-mongodb sh -c "rm -f /tmp/mongodb_dump.archive && mongodump --db=%DB_NAME% --archive=/tmp/mongodb_dump.archive --gzip"
 
@@ -109,7 +108,7 @@ echo.
 REM ============================================================================
 REM 2) Uploads backup
 REM ============================================================================
-echo [2/7] Uploads yedegi aliniyor...
+echo [2/5] Uploads yedegi aliniyor...
 
 docker exec merkoteks-backend sh -c "cd /data && rm -f /tmp/uploads.zip && (which zip >/dev/null 2>&1 || (apt-get update >/dev/null 2>&1 && apt-get install -y zip >/dev/null 2>&1)) && zip -qr /tmp/uploads.zip uploads 2>/dev/null; ls /data/uploads 2>/dev/null | wc -l"
 
@@ -132,93 +131,15 @@ echo   Dosya   : %UPLOADS_FILES%
 echo.
 
 REM ============================================================================
-REM 3) Yillik izin export
+REM 3) Manifest
 REM ============================================================================
-echo [3/7] Yillik izin verileri disa aktariliyor...
-
-docker cp scripts\export_leaves.py merkoteks-backend:/tmp/export_leaves.py
-
-docker exec merkoteks-backend sh -c "rm -rf /tmp/backup_out && mkdir -p /tmp/backup_out && python /tmp/export_leaves.py /tmp/backup_out" > "%TEMP%\personelizin_export.txt" 2>&1
-
-type "%TEMP%\personelizin_export.txt" | findstr /R "^MONGO_COUNT= ^EXCEL_ROW_COUNT= ^CSV_ROW_COUNT= ^COUNTS_MATCH="
-
-for /f "usebackq tokens=1,2 delims==" %%X in ("%TEMP%\personelizin_export.txt") do (
-    if "%%X"=="MONGO_COUNT"     set "MONGO_COUNT=%%Y"
-    if "%%X"=="EXCEL_ROW_COUNT" set "EXCEL_COUNT=%%Y"
-    if "%%X"=="CSV_ROW_COUNT"   set "CSV_COUNT=%%Y"
-    if "%%X"=="COUNTS_MATCH"    set "COUNTS_MATCH=%%Y"
-)
-
-docker cp merkoteks-backend:/tmp/backup_out/Yillik_Izin_Tum_Kayitlar.xlsx "%OUT%\Yillik_Izin_Tum_Kayitlar.xlsx" 2>NUL
-docker cp merkoteks-backend:/tmp/backup_out/Yillik_Izin_Tum_Kayitlar.csv "%OUT%\Yillik_Izin_Tum_Kayitlar.csv" 2>NUL
-docker cp merkoteks-backend:/tmp/backup_out/SON_ISLENEN_IZINLER.txt "%OUT%\SON_ISLENEN_IZINLER.txt" 2>NUL
-docker cp merkoteks-backend:/tmp/backup_out/EN_SON_IZIN.txt "%OUT%\EN_SON_IZIN.txt" 2>NUL
-
-docker exec merkoteks-backend rm -rf /tmp/backup_out /tmp/export_leaves.py 2>NUL
-
-REM ============================================================================
-REM Dosya varlik ve boyut kontrolleri
-REM ============================================================================
-set "X_XLSX=FAIL"
-set "X_CSV=FAIL"
-set "X_TXT=FAIL"
-set "X_LAST=FAIL"
-
-if exist "%OUT%\Yillik_Izin_Tum_Kayitlar.xlsx" (
-    for %%A in ("%OUT%\Yillik_Izin_Tum_Kayitlar.xlsx") do (
-        if %%~zA GTR 1000 set "X_XLSX=OK"
-    )
-)
-
-if exist "%OUT%\Yillik_Izin_Tum_Kayitlar.csv" (
-    for %%A in ("%OUT%\Yillik_Izin_Tum_Kayitlar.csv") do (
-        if %%~zA GTR 100 set "X_CSV=OK"
-    )
-)
-
-if exist "%OUT%\SON_ISLENEN_IZINLER.txt" (
-    for %%A in ("%OUT%\SON_ISLENEN_IZINLER.txt") do (
-        if %%~zA GTR 100 set "X_TXT=OK"
-    )
-)
-
-if exist "%OUT%\EN_SON_IZIN.txt" (
-    for %%A in ("%OUT%\EN_SON_IZIN.txt") do (
-        if %%~zA GTR 50 set "X_LAST=OK"
-    )
-)
-
-if "%X_XLSX%%X_CSV%%X_TXT%%X_LAST%"=="OKOKOKOK" (
-    if "%COUNTS_MATCH%"=="YES" (
-        set "EXPORT_OK=OK"
-    )
-)
-
-echo   XLSX   : %X_XLSX%
-echo   CSV    : %X_CSV%
-echo   TXT    : %X_TXT%
-echo   LAST   : %X_LAST%
-echo   Export : %EXPORT_OK%
-echo.
-
-REM ============================================================================
-REM 4) Manifest
-REM ============================================================================
-echo [4/7] Manifest olusturuluyor...
+echo [3/5] Manifest olusturuluyor...
 
 (
     echo Backup Date                : %STAMP%
     echo Backup Path                : %OUT%
     echo MongoDB backup             : %MONGO_OK%   size=%MONGO_SIZE% B
     echo Uploads backup             : %UPLOADS_OK%   files=%UPLOADS_FILES%
-    echo Annual leave Excel         : %X_XLSX%
-    echo Annual leave CSV           : %X_CSV%
-    echo Last processed TXT         : %X_TXT%
-    echo Last leave TXT             : %X_LAST%
-    echo Annual leave record count  : %MONGO_COUNT%
-    echo Excel row count            : %EXCEL_COUNT%
-    echo CSV row count              : %CSV_COUNT%
-    echo Counts match               : %COUNTS_MATCH%
 ) > "%OUT%\manifest.txt"
 
 if exist "%OUT%\manifest.txt" (
@@ -229,9 +150,9 @@ echo   Manifest : %MANIFEST_OK%
 echo.
 
 REM ============================================================================
-REM 5) SHA256
+REM 4) SHA256
 REM ============================================================================
-echo [5/7] SHA256 hash degerleri olusturuluyor...
+echo [4/5] SHA256 hash degerleri olusturuluyor...
 
 if exist "%OUT%\SHA256.txt" (
     del "%OUT%\SHA256.txt"
@@ -240,10 +161,6 @@ if exist "%OUT%\SHA256.txt" (
 for %%F in (
     "mongodb_dump.archive.gz"
     "uploads.zip"
-    "Yillik_Izin_Tum_Kayitlar.xlsx"
-    "Yillik_Izin_Tum_Kayitlar.csv"
-    "SON_ISLENEN_IZINLER.txt"
-    "EN_SON_IZIN.txt"
     "manifest.txt"
 ) do (
     if exist "%OUT%\%%~F" (
@@ -257,7 +174,7 @@ set "SHA_OK=FAIL"
 
 if exist "%OUT%\SHA256.txt" (
     for %%A in ("%OUT%\SHA256.txt") do (
-        if %%~zA GTR 100 (
+        if %%~zA GTR 50 (
             set "SHA_OK=OK"
         )
     )
@@ -267,59 +184,7 @@ echo   SHA256 : %SHA_OK%
 echo.
 
 REM ============================================================================
-REM 6) GUNCEL always-latest atomic update
-REM ============================================================================
-echo [6/7] Guncel dosyalar yenileniyor...
-
-set "LATEST_XLSX=%DATA_DIR%\backup\GUNCEL_YILLIK_IZINLER.xlsx"
-set "LATEST_TXT=%DATA_DIR%\backup\EN_SON_IZIN.txt"
-
-if "%EXPORT_OK%"=="OK" (
-    if "%COUNTS_MATCH%"=="YES" (
-
-        copy /Y "%OUT%\Yillik_Izin_Tum_Kayitlar.xlsx" "%LATEST_XLSX%.new" >NUL 2>&1
-
-        copy /Y "%OUT%\EN_SON_IZIN.txt" "%LATEST_TXT%.new" >NUL 2>&1
-
-        set "TMP_OK=YES"
-
-        if not exist "%LATEST_XLSX%.new" set "TMP_OK=NO"
-        if not exist "%LATEST_TXT%.new" set "TMP_OK=NO"
-
-        if exist "%LATEST_XLSX%.new" (
-            for %%A in ("%LATEST_XLSX%.new") do (
-                if %%~zA LSS 1000 set "TMP_OK=NO"
-            )
-        )
-
-        if exist "%LATEST_TXT%.new" (
-            for %%A in ("%LATEST_TXT%.new") do (
-                if %%~zA LSS 50 set "TMP_OK=NO"
-            )
-        )
-
-        if "!TMP_OK!"=="YES" (
-
-            move /Y "%LATEST_XLSX%.new" "%LATEST_XLSX%" >NUL
-
-            move /Y "%LATEST_TXT%.new" "%LATEST_TXT%" >NUL
-
-            set "LATEST_OK=OK"
-
-        ) else (
-
-            del /Q "%LATEST_XLSX%.new" 2>NUL
-
-            del /Q "%LATEST_TXT%.new" 2>NUL
-        )
-    )
-)
-
-echo   Latest files : %LATEST_OK%
-echo.
-
-REM ============================================================================
-REM 7) Final summary
+REM 5) Final summary
 REM ============================================================================
 echo.
 echo ============================================================
@@ -330,11 +195,8 @@ echo.
 echo Klasor         : %OUT%
 echo MongoDB backup : %MONGO_OK%  (size=%MONGO_SIZE% B)
 echo Uploads backup : %UPLOADS_OK%  (files=%UPLOADS_FILES%)
-echo Export         : %EXPORT_OK%
-echo Counts         : mongo=%MONGO_COUNT% excel=%EXCEL_COUNT% csv=%CSV_COUNT% match=%COUNTS_MATCH%
 echo Manifest       : %MANIFEST_OK%
 echo SHA256         : %SHA_OK%
-echo Latest files   : %LATEST_OK%
 echo.
 
 echo Yedek dosyalari:
@@ -347,18 +209,12 @@ REM Final success / failure
 REM ============================================================================
 if "%MONGO_OK%"=="OK" (
     if "%UPLOADS_OK%"=="OK" (
-        if "%EXPORT_OK%"=="OK" (
-            if "%COUNTS_MATCH%"=="YES" (
-                if "%MANIFEST_OK%"=="OK" (
-                    if "%SHA_OK%"=="OK" (
-                        if "%LATEST_OK%"=="OK" (
-                            echo ============================================================
-                            echo [OK] Tum yedekleme adimlari basarili.
-                            echo ============================================================
-                            exit /b 0
-                        )
-                    )
-                )
+        if "%MANIFEST_OK%"=="OK" (
+            if "%SHA_OK%"=="OK" (
+                echo ============================================================
+                echo [OK] Tum yedekleme adimlari basarili.
+                echo ============================================================
+                exit /b 0
             )
         )
     )

@@ -5,6 +5,10 @@
 FROM python:3.11-slim-bookworm
 
 # System deps: LibreOffice + Türkçe font'lar + poppler + build essentials
+# unoconv: PDF dönüştürmeyi kalıcı bir LibreOffice "dinleyici" sürecine
+# bağlanarak yapmamızı sağlar — bkz. server.py _xlsx_to_pdf /
+# _ensure_libreoffice_listener. Bunsuz sistem eskisi gibi (yavaş ama
+# çalışır) yönteme otomatik döner, o yüzden riski yok.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice \
     libreoffice-calc \
@@ -13,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     fonts-liberation \
     poppler-utils \
+    unoconv \
     curl \
     ca-certificates \
     && apt-get clean \
@@ -20,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # LibreOffice sanity check at build time
 RUN libreoffice --version && soffice --version
+RUN unoconv --version || echo "UYARI: unoconv calismiyor, PDF donusturme eski (yavas) yontemle devam edecek"
 
 WORKDIR /app
 

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Upload, RefreshCw, FileText, FileSpreadsheet, AlertTriangle, Save, X, Trash2, Check } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Plus, RefreshCw, FileText, AlertTriangle, Save, Trash2, Check, Globe } from "lucide-react";
 import { api, formatApiError } from "@/lib/api";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -23,16 +23,10 @@ function toTr(iso) {
 }
 function fmtNum(n) { return String(Number(n || 0)).replace(".", ","); }
 
-const STATUS_LABEL = {
-  valid: { text: "Geçerli", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
-  duplicate: { text: "Mükerrer", cls: "bg-slate-100 text-slate-600 border-slate-200" },
-  invalid: { text: "Hatalı", cls: "bg-red-50 text-red-700 border-red-200" },
-  review: { text: "Kontrol Gerekli", cls: "bg-amber-50 text-amber-700 border-amber-200" },
-};
-
 export default function Holidays() {
   const { user } = useAuth();
   const canManage = user?.role === "admin" || user?.role === "hr";
+  const isAdmin = user?.role === "admin";
   const currentYear = new Date().getFullYear();
   const [year, setYear] = useState(String(currentYear));
   const [availableYears, setAvailableYears] = useState([]);
@@ -42,14 +36,20 @@ export default function Holidays() {
   const [typeFilter, setTypeFilter] = useState("all");
   const [activeTab, setActiveTab] = useState("all");
 
-  const [importOpen, setImportOpen] = useState(false);
-  const [importText, setImportText] = useState("");
-  const [importResult, setImportResult] = useState(null);
+  // Manuel tatil ekleme — Tarih / Tatil Adı / Gün alanlarını içeren form.
+  const [addOpen, setAddOpen] = useState(false);
+  const [addDate, setAddDate] = useState("");
+  const [addName, setAddName] = useState("");
+  const [addDayValue, setAddDayValue] = useState("1");
+  const [addBusy, setAddBusy] = useState(false);
 
-  const [xlsxOpen, setXlsxOpen] = useState(false);
-  const [xlsxPreview, setXlsxPreview] = useState(null); // {filename, stats, rows}
-  const [xlsxBusy, setXlsxBusy] = useState(false);
-  const [xlsxFilter, setXlsxFilter] = useState("all");
+  // Resmi kaynaktan otomatik çekim — dialog kendi bağımsız yıl alanına
+  // sahiptir, sayfanın üstündeki "Yıl" seçicisinin aralığıyla sınırlı
+  // değildir; her yıl (geçmiş/gelecek) serbestçe girilebilir.
+  const [fetchOpen, setFetchOpen] = useState(false);
+  const [fetchYear, setFetchYear] = useState(String(currentYear));
+  const [fetchBusy, setFetchBusy] = useState(false);
+  const [fetchResult, setFetchResult] = useState(null);
 
   const load = async () => {
     setBusy(true);
@@ -65,19 +65,45 @@ export default function Holidays() {
   };
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [year]);
 
-  const doTextImport = async () => {
-    if (!importText.trim()) { toast.error("Yapıştırılan metin boş"); return; }
-    setBusy(true);
+  const doManualAdd = async () => {
+    if (!addDate) { toast.error("Tarih seçin"); return; }
+    if (!addName.trim()) { toast.error("Tatil/izin adı girin"); return; }
+    const [y, m, d] = addDate.split("-");
+    const line = `${d}.${m}.${y}\t${addName.trim()}\t${addDayValue}`;
+    setAddBusy(true);
     try {
       const { data } = await api.post("/holidays/bulk-import-text", {
-        text: importText, filename: "Yapıştırılan metin.txt",
+        text: line, filename: "Manuel Ekleme",
       });
-      setImportResult(data);
-      toast.success(`+${data.added} yeni, ~${data.updated} güncel · Yıllar: ${data.affected_years.join(", ")}`);
-      if (data.affected_years?.length) setYear(String(data.affected_years[data.affected_years.length - 1]));
+      toast.success(`"${addName.trim()}" eklendi (${d}.${m}.${y})`);
+      setYear(y);
+      setActiveTab("all");
+      setAddOpen(false);
+      setAddDate(""); setAddName(""); setAddDayValue("1");
       await load();
     } catch (e) { toast.error(formatApiError(e)); }
-    finally { setBusy(false); }
+    finally { setAddBusy(false); }
+  };
+
+  const doFetchOfficial = async () => {
+    setFetchBusy(true);
+    try {
+      const { data } = await api.post("/holidays/fetch-official", null, { params: { year: fetchYear } });
+      setFetchResult(data);
+      toast.success(`${fetchYear} yılı çekildi: +${data.added} yeni, ~${data.updated} güncel — "Kontrol Gerekli" sekmesinden onaylayın`);
+      setYear(String(fetchYear));
+      await load();
+    } catch (e) { toast.error(formatApiError(e)); }
+    finally { setFetchBusy(false); }
+  };
+
+  const doDeleteRecord = async (h) => {
+    if (!window.confirm(`"${h.name}" (${toTr(h.date)}) kalıcı olarak silinsin mi?`)) return;
+    try {
+      await api.delete(`/holidays/records/${h.id}`);
+      toast.success("Tatil kaydı silindi");
+      setRecords((prev) => prev.filter((r) => r.id !== h.id));
+    } catch (e) { toast.error(formatApiError(e)); }
   };
 
   const filtered = useMemo(() => records.filter((r) => {
@@ -92,19 +118,30 @@ export default function Holidays() {
     records.filter((r) => r.needs_review || (r.name || "").trim() === "Tatil Tanımı Belirtilmemiş"),
   [records]);
 
+  // Yıl seçici SADECE zaten kaydı olan yılları göstermesin — "Resmi Kaynaktan
+  // Getir" ile henüz hiç kaydı olmayan bir yılı (ör. gelecek yıl) seçebilmek
+  // için makul bir aralık (bugünden birkaç yıl öncesi/sonrası) her zaman
+  // listeye eklenir, mevcut kayıtlı yıllarla birleştirilir (Iter 67).
+  const yearOptions = useMemo(() => {
+    const set = new Set((availableYears || []).map(Number));
+    for (let y = currentYear - 3; y <= currentYear + 10; y++) set.add(y);
+    return Array.from(set).sort((a, b) => a - b);
+  }, [availableYears, currentYear]);
+
   return (
     <div className="space-y-4" data-testid="holidays-page">
       <div className="sticky-page-title flex items-start justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight text-slate-900">Resmi ve Dinî Tatiller</h1>
-          <p className="text-sm text-slate-500 mt-1">Yıl bazlı tatil kayıtları. Metin veya Excel dosyasından toplu yükleyin.</p>
+          <h1 className="text-3xl font-bold tracking-tight text-slate-900">Tatiller</h1>
+          <p className="text-sm text-slate-500 mt-1">Yıl bazlı tatil kayıtları. Manuel ekleyin veya resmi kaynaktan otomatik çekin.</p>
         </div>
         <div className="flex items-center gap-2">
-          <Button onClick={() => setXlsxOpen(true)} variant="outline" data-testid="holidays-xlsx-btn">
-            <FileSpreadsheet size={14} className="mr-1" /> Excel Yükle
+          <Button onClick={() => { setFetchResult(null); setFetchYear(year); setFetchOpen(true); }} variant="outline"
+                  className="border-blue-200 text-blue-700 hover:bg-blue-50" data-testid="holidays-fetch-official-btn">
+            <Globe size={14} className="mr-1" /> Resmi Kaynaktan Getir
           </Button>
-          <Button onClick={() => setImportOpen(true)} className="bg-blue-600 hover:bg-blue-700" data-testid="holidays-import-btn">
-            <Upload size={14} className="mr-1" /> Metinden Yükle
+          <Button onClick={() => setAddOpen(true)} className="bg-blue-600 hover:bg-blue-700" data-testid="holidays-add-btn">
+            <Plus size={14} className="mr-1" /> Tatil Ekle
           </Button>
         </div>
       </div>
@@ -124,8 +161,7 @@ export default function Holidays() {
               <Select value={year} onValueChange={setYear}>
                 <SelectTrigger className="w-28 h-9" data-testid="holidays-year-select"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {availableYears.length === 0 && <SelectItem value={String(currentYear)}>{currentYear}</SelectItem>}
-                  {availableYears.map((y) => <SelectItem key={y} value={String(y)}>{y}</SelectItem>)}
+                  {yearOptions.map((y) => <SelectItem key={y} value={String(y)}>{y}</SelectItem>)}
                 </SelectContent>
               </Select>
               <Select value={typeFilter} onValueChange={setTypeFilter}>
@@ -146,7 +182,7 @@ export default function Holidays() {
             <div className="overflow-x-auto">
               <table className="table-clean table-sticky-head w-full text-sm">
                 <thead>
-                  <tr><th>Tarih</th><th>Tatil Adı</th><th>Yıl</th><th>Tür</th><th>Kategori</th><th className="text-right">Gün</th><th>Süre</th><th>Durum</th><th>Kaynak</th></tr>
+                  <tr><th>Tarih</th><th>Tatil Adı</th><th>Yıl</th><th className="text-right">Gün</th><th>Süre</th><th>Durum</th><th>Kaynak</th>{isAdmin && <th className="w-12">İşlem</th>}</tr>
                 </thead>
                 <tbody>
                   {filtered.map((h) => (
@@ -154,15 +190,22 @@ export default function Holidays() {
                       <td className="font-mono">{toTr(h.date)}</td>
                       <td className={`font-medium ${h.needs_review ? "text-amber-700" : ""}`}>{h.name}</td>
                       <td className="tabular-nums">{h.year}</td>
-                      <td>{h.type === "half" ? <Badge className="bg-amber-50 text-amber-700 border border-amber-200">Yarım</Badge> : <Badge className="bg-emerald-50 text-emerald-700 border border-emerald-200">Tam</Badge>}</td>
-                      <td className="text-xs text-slate-600">{h.category || "—"}</td>
                       <td className="text-right tabular-nums font-semibold">{fmtNum(h.day_value)}</td>
                       <td className="text-xs">{h.type === "half" ? "Yarım Gün" : "Tam Gün"}</td>
                       <td>{h.needs_review ? <Badge variant="secondary" className="bg-amber-50 text-amber-700 border-amber-200 text-[10px]">Kontrol Gerekli</Badge> : (h.active ? <Badge className="bg-slate-100 text-slate-700 border-slate-200 text-[10px]">Aktif</Badge> : <Badge className="bg-slate-50 text-slate-400 text-[10px]">Pasif</Badge>)}</td>
                       <td className="text-xs text-slate-500"><FileText size={11} className="inline mr-1" />{h.source}</td>
+                      {isAdmin && (
+                        <td>
+                          <Button size="sm" variant="ghost" onClick={() => doDeleteRecord(h)}
+                                  className="h-7 w-7 p-0 text-red-500 hover:text-red-700 hover:bg-red-50"
+                                  data-testid={`holiday-delete-${h.id}`} title="Bu tatili sil">
+                            <Trash2 size={13} />
+                          </Button>
+                        </td>
+                      )}
                     </tr>
                   ))}
-                  {filtered.length === 0 && !busy && (<tr><td colSpan={9} className="text-center py-8 text-slate-400">{records.length === 0 ? `${year} yılı için kayıt yok.` : "Filtreye uyan kayıt yok."}</td></tr>)}
+                  {filtered.length === 0 && !busy && (<tr><td colSpan={isAdmin ? 8 : 7} className="text-center py-8 text-slate-400">{records.length === 0 ? `${year} yılı için kayıt yok.` : "Filtreye uyan kayıt yok."}</td></tr>)}
                 </tbody>
               </table>
             </div>
@@ -170,224 +213,104 @@ export default function Holidays() {
         </TabsContent>
 
         <TabsContent value="review" className="mt-3">
-          <ReviewTab records={reviewRecords} canManage={canManage} onRefresh={load} year={year} setYear={setYear} availableYears={availableYears} currentYear={currentYear} />
+          <ReviewTab records={reviewRecords} canManage={canManage} onRefresh={load} year={year} setYear={setYear} availableYears={yearOptions} currentYear={currentYear} />
         </TabsContent>
       </Tabs>
 
-      {/* Metin yükleme dialog */}
-      <Dialog open={importOpen} onOpenChange={setImportOpen}>
-        <DialogContent className="max-w-2xl">
+      {/* Manuel tatil ekleme dialog */}
+      <Dialog open={addOpen} onOpenChange={(v) => { setAddOpen(v); if (!v) { setAddDate(""); setAddName(""); setAddDayValue("1"); } }}>
+        <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Tatil Listesi — Metinden Yükle</DialogTitle>
-            <DialogDescription>Her satır: TARİH TAB TATIL_ADI TAB GUN_DEGERI. Örn: 28.10.2026 arefe 0,5</DialogDescription>
+            <DialogTitle>Tatil Ekle</DialogTitle>
+            <DialogDescription>Tarih, tatil/izin adı ve gün süresini girip kaydedin. Kaydedilen tatil "Tüm Tatiller" listesinde görünür.</DialogDescription>
           </DialogHeader>
-          {!importResult ? (
+          <div className="space-y-3">
+            <div>
+              <Label className="text-xs">Tarih</Label>
+              <Input type="date" value={addDate} onChange={(e) => setAddDate(e.target.value)} data-testid="holidays-add-date" />
+            </div>
+            <div>
+              <Label className="text-xs">Tatil / İzin Adı</Label>
+              <Input value={addName} onChange={(e) => setAddName(e.target.value)} placeholder="Örn: 1 Mayıs Emek ve Dayanışma Günü" data-testid="holidays-add-name" />
+            </div>
+            <div>
+              <Label className="text-xs">Gün</Label>
+              <Select value={addDayValue} onValueChange={setAddDayValue}>
+                <SelectTrigger className="h-9" data-testid="holidays-add-dayvalue"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="1">Tam Gün (1)</SelectItem>
+                  <SelectItem value="0.5">Yarım Gün / Arife (0,5)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setAddOpen(false)}>Vazgeç</Button>
+            <Button onClick={doManualAdd} disabled={addBusy} className="bg-blue-600 hover:bg-blue-700" data-testid="holidays-add-confirm">
+              <Save size={13} className="mr-1" /> Kaydet
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Resmi kaynaktan otomatik çekim dialog */}
+      <Dialog open={fetchOpen} onOpenChange={(v) => { setFetchOpen(v); if (!v) setFetchResult(null); }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Resmi Kaynaktan Getir</DialogTitle>
+            <DialogDescription>
+              Getirmek istediğiniz yılı girin. O yıla ait resmi ve dinî tatiller
+              (arife dahil) çevrimiçi resmi kaynaktan otomatik çekilip içe
+              aktarılacak. Dinî bayram tarihleri de dahil olduğu için, içe
+              aktarılan tüm kayıtlar bir kerelik göz kontrolü için "Kontrol
+              Gerekli" sekmesine düşer. Herhangi bir geçmiş veya gelecek yıl
+              girilebilir.
+            </DialogDescription>
+          </DialogHeader>
+          {!fetchResult ? (
             <div className="space-y-3">
-              <Textarea rows={14} value={importText} onChange={(e) => setImportText(e.target.value)} placeholder="Tarih Tatil Tanımı    Gün Değeri..." className="font-mono text-xs" data-testid="holidays-import-textarea" />
+              <div>
+                <Label className="text-xs">Yıl</Label>
+                <Input type="number" value={fetchYear} onChange={(e) => setFetchYear(e.target.value)}
+                       className="w-32" data-testid="holidays-fetch-year-input" />
+              </div>
               <DialogFooter>
-                <Button variant="ghost" onClick={() => setImportOpen(false)}>Vazgeç</Button>
-                <Button onClick={doTextImport} disabled={busy} className="bg-blue-600 hover:bg-blue-700" data-testid="holidays-import-confirm"><Upload size={13} className="mr-1" /> İçe Aktar</Button>
+                <Button variant="ghost" onClick={() => setFetchOpen(false)}>Vazgeç</Button>
+                <Button onClick={doFetchOfficial} disabled={fetchBusy || !fetchYear}
+                        className="bg-blue-600 hover:bg-blue-700" data-testid="holidays-fetch-official-confirm">
+                  <Globe size={13} className={`mr-1 ${fetchBusy ? "animate-spin" : ""}`} />
+                  {fetchBusy ? "Çekiliyor..." : `${fetchYear || ""} Yılını Getir`}
+                </Button>
               </DialogFooter>
             </div>
           ) : (
-            <div className="space-y-3" data-testid="import-result">
+            <div className="space-y-3" data-testid="fetch-official-result">
               <Card className="p-3 border border-emerald-200 bg-emerald-50">
-                <div className="text-sm font-semibold text-emerald-800 mb-2">Aktarım Tamamlandı</div>
+                <div className="text-sm font-semibold text-emerald-800 mb-2">Çekim Tamamlandı</div>
                 <div className="grid grid-cols-2 gap-2 text-sm">
-                  <div>Toplam satır: <b>{importResult.total_lines}</b></div>
-                  <div>Eklenen: <b className="text-emerald-700">{importResult.added}</b></div>
-                  <div>Güncellenen: <b className="text-blue-700">{importResult.updated}</b></div>
-                  <div>Mükerrer (atlanan): <b className="text-slate-600">{importResult.duplicates_skipped}</b></div>
-                  <div>Boş tatil adı: <b className="text-amber-700">{importResult.empty_name}</b></div>
-                  <div>Geçersiz tarih: <b className="text-red-700">{importResult.invalid_date}</b></div>
-                  <div className="col-span-2">Etkilenen yıllar: <b>{importResult.affected_years.join(", ")}</b></div>
+                  <div>Toplam satır: <b>{fetchResult.total_lines}</b></div>
+                  <div>Eklenen: <b className="text-emerald-700">{fetchResult.added}</b></div>
+                  <div>Güncellenen: <b className="text-blue-700">{fetchResult.updated}</b></div>
+                  <div>Mükerrer (atlanan): <b className="text-slate-600">{fetchResult.duplicates_skipped}</b></div>
+                  <div className="col-span-2">Kaynak: <b>{fetchResult.source}</b></div>
                 </div>
               </Card>
+              <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
+                Bu kayıtlar "Kontrol Gerekli" sekmesine düştü — özellikle dinî bayram
+                tarihlerini bir kez göz atıp onaylamanız önerilir.
+              </div>
               <DialogFooter>
-                <Button variant="outline" onClick={() => { setImportResult(null); setImportText(""); }}>Yeni Aktarım</Button>
-                <Button onClick={() => { setImportOpen(false); setImportResult(null); setImportText(""); }}>Kapat</Button>
+                <Button onClick={() => { setFetchOpen(false); setFetchResult(null); }}>Kapat</Button>
               </DialogFooter>
             </div>
           )}
         </DialogContent>
       </Dialog>
 
-      {/* Excel yükleme dialog */}
-      <XlsxImportDialog
-        open={xlsxOpen}
-        onOpenChange={(v) => { setXlsxOpen(v); if (!v) { setXlsxPreview(null); setXlsxFilter("all"); } }}
-        preview={xlsxPreview}
-        setPreview={setXlsxPreview}
-        busy={xlsxBusy}
-        setBusy={setXlsxBusy}
-        onDone={async (affectedYears) => {
-          if (affectedYears?.length) setYear(String(affectedYears[affectedYears.length - 1]));
-          await load();
-        }}
-        filter={xlsxFilter}
-        setFilter={setXlsxFilter}
-      />
     </div>
   );
 }
 
-// ============================================================================
-// XLSX Import Dialog — drag & drop + preview + confirm
-// ============================================================================
-function XlsxImportDialog({ open, onOpenChange, preview, setPreview, busy, setBusy, onDone, filter, setFilter }) {
-  const inputRef = useRef(null);
-  const [dragOver, setDragOver] = useState(false);
-
-  const upload = async (file) => {
-    if (!file) return;
-    const isXlsx = file.name.toLowerCase().endsWith(".xlsx");
-    if (!isXlsx) { toast.error("Yalnızca .xlsx dosyaları destekleniyor"); return; }
-    setBusy(true);
-    try {
-      const fd = new FormData();
-      fd.append("file", file);
-      const { data } = await api.post("/holidays/import/excel/preview", fd, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-      setPreview(data);
-    } catch (e) { toast.error(formatApiError(e)); }
-    finally { setBusy(false); }
-  };
-
-  const onDrop = (ev) => {
-    ev.preventDefault();
-    setDragOver(false);
-    const f = ev.dataTransfer.files?.[0];
-    if (f) upload(f);
-  };
-
-  const doConfirm = async () => {
-    if (!preview?.rows?.length) return;
-    setBusy(true);
-    try {
-      const { data } = await api.post("/holidays/import/excel/confirm", {
-        rows: preview.rows, filename: preview.filename,
-      });
-      toast.success(`+${data.added} yeni kayıt, ${data.skipped} atlandı`);
-      onDone(data.affected_years || []);
-      onOpenChange(false);
-    } catch (e) { toast.error(formatApiError(e)); }
-    finally { setBusy(false); }
-  };
-
-  const filteredRows = useMemo(() => {
-    if (!preview?.rows) return [];
-    if (filter === "all") return preview.rows;
-    return preview.rows.filter((r) => r.status === filter);
-  }, [preview, filter]);
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
-        <DialogHeader>
-          <DialogTitle>Tatil Listesi — Excel'den Yükle</DialogTitle>
-          <DialogDescription>Beklenen kolonlar: <b>Tarih</b> · <b>Tatil Tanımı</b> · <b>Gün Değeri</b> (1 = tam gün, 0,5 = yarım/arife). Kayıtlar önizlenecek, siz onaylayana dek DB'ye yazılmayacaktır.</DialogDescription>
-        </DialogHeader>
-
-        {!preview ? (
-          <div
-            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={onDrop}
-            onClick={() => inputRef.current?.click()}
-            className={`border-2 border-dashed rounded-lg py-16 text-center cursor-pointer transition-colors ${dragOver ? "border-blue-500 bg-blue-50" : "border-slate-300 bg-slate-50 hover:border-blue-400"}`}
-            data-testid="xlsx-dropzone"
-          >
-            <FileSpreadsheet size={48} className="mx-auto text-slate-400 mb-3" />
-            <div className="text-sm font-medium text-slate-700">Excel dosyasını buraya sürükleyin veya tıklayın</div>
-            <div className="text-xs text-slate-500 mt-1">.xlsx (Tarih · Tatil Tanımı · Gün Değeri)</div>
-            <input type="file" accept=".xlsx" hidden ref={inputRef}
-                   onChange={(e) => upload(e.target.files?.[0])} data-testid="xlsx-file-input" />
-            {busy && <div className="mt-3 text-xs text-blue-700">Dosya işleniyor...</div>}
-          </div>
-        ) : (
-          <div className="flex-1 overflow-hidden flex flex-col gap-3">
-            {/* Stats */}
-            <div className="grid grid-cols-5 gap-2 text-xs">
-              <StatBox label="Toplam" value={preview.stats.total} color="slate" onClick={() => setFilter("all")} active={filter === "all"} />
-              <StatBox label="Geçerli" value={preview.stats.valid} color="emerald" onClick={() => setFilter("valid")} active={filter === "valid"} />
-              <StatBox label="Mükerrer" value={preview.stats.duplicate} color="slate" onClick={() => setFilter("duplicate")} active={filter === "duplicate"} />
-              <StatBox label="Hatalı" value={preview.stats.invalid} color="red" onClick={() => setFilter("invalid")} active={filter === "invalid"} />
-              <StatBox label="Kontrol Gerekli" value={preview.stats.review} color="amber" onClick={() => setFilter("review")} active={filter === "review"} />
-            </div>
-
-            <div className="text-xs text-slate-500 flex items-center justify-between">
-              <div>Dosya: <b>{preview.filename}</b> · Gösterilen: <b>{filteredRows.length}</b></div>
-              <Button size="sm" variant="ghost" onClick={() => setPreview(null)} data-testid="xlsx-reset"><X size={13} className="mr-1" /> Yeni Dosya</Button>
-            </div>
-
-            <div className="flex-1 overflow-auto border border-slate-200 rounded-md">
-              <table className="w-full text-xs">
-                <thead className="bg-slate-100 sticky top-0">
-                  <tr>
-                    <th className="p-2 text-left">Satır</th>
-                    <th className="p-2 text-left">Tarih</th>
-                    <th className="p-2 text-left">Tatil Tanımı</th>
-                    <th className="p-2 text-right">Gün</th>
-                    <th className="p-2 text-left">Tür</th>
-                    <th className="p-2 text-left">Durum</th>
-                    <th className="p-2 text-left">Not</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredRows.map((r, i) => {
-                    const st = STATUS_LABEL[r.status] || STATUS_LABEL.invalid;
-                    return (
-                      <tr key={i} className={r.status === "invalid" ? "bg-red-50/40" : r.status === "duplicate" ? "bg-slate-50/40" : r.status === "review" ? "bg-amber-50/40" : ""}>
-                        <td className="p-2 font-mono text-slate-500">{r.row}</td>
-                        <td className="p-2 font-mono">{r.date_tr || r.raw_date || "—"}</td>
-                        <td className="p-2">{r.name || <span className="text-slate-400 italic">(boş)</span>}</td>
-                        <td className="p-2 text-right tabular-nums">{r.day_value !== undefined ? fmtNum(r.day_value) : (r.raw_day || "—")}</td>
-                        <td className="p-2">{r.type === "half" ? "Yarım" : r.type === "full" ? "Tam" : "—"}</td>
-                        <td className="p-2"><Badge className={`${st.cls} text-[10px]`}>{st.text}</Badge></td>
-                        <td className="p-2 text-slate-500">{r.reason || (r.status === "valid" ? "Yazılacak" : r.status === "review" ? "Ad boş — Kontrol Gerekli olarak yazılacak" : "")}</td>
-                      </tr>
-                    );
-                  })}
-                  {filteredRows.length === 0 && (
-                    <tr><td colSpan={7} className="text-center py-6 text-slate-400">Bu filtreye uyan satır yok.</td></tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            <DialogFooter>
-              <Button variant="ghost" onClick={() => onOpenChange(false)} data-testid="xlsx-cancel">Vazgeç</Button>
-              <Button onClick={doConfirm} disabled={busy || preview.stats.valid === 0}
-                      className="bg-blue-600 hover:bg-blue-700" data-testid="xlsx-confirm">
-                <Check size={13} className="mr-1" /> Onayla ve Kaydet ({preview.stats.valid})
-              </Button>
-            </DialogFooter>
-          </div>
-        )}
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function StatBox({ label, value, color, onClick, active }) {
-  const colorMap = {
-    slate: "border-slate-200 bg-slate-50 text-slate-700",
-    emerald: "border-emerald-200 bg-emerald-50 text-emerald-700",
-    red: "border-red-200 bg-red-50 text-red-700",
-    amber: "border-amber-200 bg-amber-50 text-amber-700",
-  };
-  return (
-    <button
-      onClick={onClick}
-      className={`text-left border rounded p-2 transition-shadow ${colorMap[color]} ${active ? "ring-2 ring-blue-500" : "hover:shadow"}`}
-      data-testid={`xlsx-stat-${label}`}
-    >
-      <div className="text-[10px] uppercase font-semibold tracking-wide opacity-80">{label}</div>
-      <div className="text-lg font-bold tabular-nums">{value}</div>
-    </button>
-  );
-}
 
 // ============================================================================
 // Review Tab — Kontrol Gerekli

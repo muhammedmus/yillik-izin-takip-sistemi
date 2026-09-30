@@ -94,7 +94,8 @@ h1, h2, h3, h4 { font-family: 'Manrope', system-ui, sans-serif; letter-spacing: 
 
 /* Print styles for A4 leave-request form + document preview */
 @media print {
-  @page { size: A4 portrait; margin: 0; }
+  /* Sayfa kenar boşlukları: Üst/Alt 1,9cm, Sol/Sağ 1,8cm (kullanıcı referans ayarları) */
+  @page { size: A4 portrait; margin: 19mm 18mm; }
   html, body, #root {
     margin: 0 !important; padding: 0 !important;
     background: #fff !important;
@@ -115,8 +116,11 @@ h1, h2, h3, h4 { font-family: 'Manrope', system-ui, sans-serif; letter-spacing: 
   }
   .no-print { display: none !important; }
   .print-page {
-    width: 210mm; max-width: 210mm;
-    margin: 0 auto; padding: 12mm;
+    /* @page margin zaten kenar boşluğunu ayırdığı için burada ekstra
+       padding/margin/genişlik sınırı EKLEMİYORUZ — aksi halde boşluk
+       katlanır (çift boşluk) veya sayfa merkezlenmesi bozulur. */
+    width: 100%; max-width: none;
+    margin: 0; padding: 0;
     color: #000 !important; background: #fff !important;
     box-shadow: none !important; border: 0 !important;
     overflow: visible !important;

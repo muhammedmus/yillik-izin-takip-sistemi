@@ -46,6 +46,12 @@ export default function Personnel() {
   const [sirket, setSirket] = useState("");
   const [consentAdvance, setConsentAdvance] = useState(false);
   const [sort, setSort] = useState({ field: "ad_soyad", dir: "asc" });
+  // ZKAccess gibi dış kaynaklardan sadece ad/sicil ile otomatik eklenmiş,
+  // bilgileri henüz tamamlanmamış ("needs_completion") personel, hangi
+  // sütuna göre sıralanırsa sıralansın HER ZAMAN en üstte gösterilir.
+  // Bilgileri girilip kaydedildiğinde (needs_completion=false olduğunda)
+  // otomatik olarak normal sıraya döner — ayrı bir açma/kapama gerekmez.
+  const groupIncomplete = true;
   const [limit, setLimit] = useState(100);
   const [skip, setSkip] = useState(0);
 
@@ -114,6 +120,7 @@ export default function Personnel() {
     if (departman) params.departman = departman;
     if (sirket) params.sirket = sirket;
     if (consentAdvance) params.consent_advance = true;
+    if (groupIncomplete) params.group_incomplete_first = true;
     try {
       const [{ data }, { data: cnt }, sum] = await Promise.all([
         api.get("/personnel", { params }),
@@ -143,6 +150,11 @@ export default function Personnel() {
           return 0;
         };
         display = [...data].sort((a, b) => {
+          if (groupIncomplete) {
+            const ca = a.needs_completion ? 1 : 0;
+            const cb = b.needs_completion ? 1 : 0;
+            if (ca !== cb) return cb - ca; // eksik bilgililer önce
+          }
           const va = valueOf(a); const vb = valueOf(b);
           return sort.dir === "asc" ? va - vb : vb - va;
         }).slice(skip, skip + limit);
@@ -258,7 +270,7 @@ export default function Personnel() {
     } catch (e) { toast.error(formatApiError(e)); }
   };
   const doHardDelete = async () => {
-    if (!delData.password || !delData.reason.trim()) return toast.error("Şifre ve gerekçe zorunlu");
+    if (!delData.password) return toast.error("Yönetici şifresi zorunlu");
     setDelBusy(true);
     try {
       await api.post(`/personnel/${delTarget.id}/delete`, { password: delData.password, reason: delData.reason.trim() });
@@ -777,10 +789,22 @@ export default function Personnel() {
               {items.map((p) => {
                 const rem = balances[p.id]?.remaining;
                 const remClr = rem === undefined || rem === null ? "" : rem < 0 ? "text-red-600 font-semibold" : rem < 10 ? "text-amber-700" : "";
+                const incomplete = !!p.needs_completion;
                 return (
-                  <tr key={p.id} className="cursor-pointer" data-testid={`personnel-row-${p.sicil_no}`}>
+                  <tr key={p.id}
+                      className={`cursor-pointer ${incomplete ? "bg-amber-50 hover:bg-amber-100 border-l-4 border-l-amber-400" : ""}`}
+                      data-testid={`personnel-row-${p.sicil_no}`}>
                     <td className="font-mono text-xs" onClick={() => nav(`/personel/${p.id}`)}>{p.sicil_no}</td>
-                    <td className="font-medium text-slate-900" onClick={() => nav(`/personel/${p.id}`)}>{p.ad_soyad}</td>
+                    <td className="font-medium text-slate-900" onClick={() => nav(`/personel/${p.id}`)}>
+                      <span className="inline-flex items-center gap-2">
+                        {p.ad_soyad}
+                        {incomplete && (
+                          <Badge className="bg-amber-100 text-amber-800 border-amber-300 text-[10px] font-semibold">
+                            <AlertCircle size={10} className="mr-1" /> Eksik Bilgi
+                          </Badge>
+                        )}
+                      </span>
+                    </td>
                     <td onClick={() => nav(`/personel/${p.id}`)}>{p.departman || "—"}</td>
                     <td onClick={() => nav(`/personel/${p.id}`)}>{p.sirket || "—"}</td>
                     <td className="font-mono text-xs" onClick={() => nav(`/personel/${p.id}`)}>{toTr(p.ise_giris)}</td>
@@ -895,7 +919,7 @@ export default function Personnel() {
           <div className="space-y-3">
             <div className="text-sm text-slate-600">Yönetici: <b>{user?.name}</b></div>
             <div><Label>Yönetici Şifresi</Label><Input type="password" value={delData.password} onChange={(e) => setDelData((s) => ({ ...s, password: e.target.value }))} data-testid="personnel-delete-pw" /></div>
-            <div><Label>Silme Gerekçesi *</Label><Textarea rows={3} value={delData.reason} onChange={(e) => setDelData((s) => ({ ...s, reason: e.target.value }))} data-testid="personnel-delete-reason" /></div>
+            <div><Label>Silme Gerekçesi <span className="text-slate-400 font-normal">(isteğe bağlı)</span></Label><Textarea rows={3} value={delData.reason} onChange={(e) => setDelData((s) => ({ ...s, reason: e.target.value }))} data-testid="personnel-delete-reason" /></div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setDelStep(0)}>İptal</Button>

@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link, useParams, useNavigate } from "react-router-dom";
 import {
   Pencil, Trash2, CalendarPlus, Printer, FileSignature, FileText, AlertTriangle,
   LogOut, FileBarChart, ArrowLeft, FileSpreadsheet, Eye, EyeOff, Skull,
+  ChevronLeft, ChevronRight,
 } from "lucide-react";
 import { toast } from "sonner";
 import { api, API_BASE, formatApiError } from "@/lib/api";
@@ -23,6 +25,230 @@ function toTr(iso) {
   return `${d}.${m}.${y}`;
 }
 function fmtNum(n) { return String(n).replace(".", ","); }
+
+// --- Aralık takvimi için yardımcılar --------------------------------------
+const TR_MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+  "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"];
+const TR_WEEKDAYS = ["Pt", "Sa", "Ça", "Pe", "Cu", "Ct", "Pa"];
+
+function ymd(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function parseYmd(s) {
+  if (!s) return null;
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+/**
+ * Tek takvimden başlangıç+bitiş aralığı seçimi. İlk tıklama başlangıcı,
+ * ikinci tıklama bitişi belirler. Başlangıç seçilip bitiş henüz
+ * seçilmemişken günlerin üzerine gelindiğinde, imlecin hemen üzerinde
+ * o ana kadarki KESİN gün sayısını (backend'den, resmi tatil ve hafta
+ * sonları dahil) gösteren küçük bir etiket belirir.
+ */
+function LeaveRangeCalendar({ startDate, endDate, personnelId, onChange }) {
+  const initial = parseYmd(startDate) || new Date();
+  const [viewMonth, setViewMonth] = useState(new Date(initial.getFullYear(), initial.getMonth(), 1));
+  const [hoverPos, setHoverPos] = useState(null); // { x, y }
+  const [hoverDateKey, setHoverDateKey] = useState(null); // ymd string, üzerine gelinen gün
+  const [hoverDays, setHoverDays] = useState(null); // backend'den gelen KESİN gün sayısı
+  const [holidaysByYear, setHolidaysByYear] = useState({}); // { 2026: { "2026-10-28": "Cumhuriyet Bayramı Arifesi", ... } }
+
+  const start = parseYmd(startDate);
+  const end = parseYmd(endDate);
+  const nextViewMonth = new Date(viewMonth.getFullYear(), viewMonth.getMonth() + 1, 1);
+
+  // Ekranda gösterilen iki ay hangi yıl(lar)a düşüyorsa, o yıl(lar)ın resmi/dini
+  // tatil listesini (bir kez) çeker ve önbelleğe alır — Aralık/Ocak geçişinde
+  // iki farklı yıl olabileceği için her ikisi de kontrol edilir.
+  useEffect(() => {
+    const y1 = viewMonth.getFullYear();
+    const y2 = viewMonth.getMonth() === 11 ? y1 + 1 : y1;
+    const years = Array.from(new Set([y1, y2])).filter((y) => !holidaysByYear[y]);
+    if (years.length === 0) return;
+    let cancelled = false;
+    Promise.all(years.map((y) => api.get("/holidays/records", { params: { year: y } }).then((r) => [y, r.data])))
+      .then((results) => {
+        if (cancelled) return;
+        setHolidaysByYear((prev) => {
+          const next = { ...prev };
+          for (const [y, items] of results) {
+            const map = {};
+            for (const h of items || []) {
+              const key = (h.date || "").slice(0, 10);
+              if (key) map[key] = h.name;
+            }
+            next[y] = map;
+          }
+          return next;
+        });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMonth.getFullYear(), viewMonth.getMonth()]);
+
+  const getHolidayName = (key) => holidaysByYear[Number(key.slice(0, 4))]?.[key];
+
+  // Üzerine gelinen gün değiştikçe (piksel piksel değil, GÜN değiştikçe),
+  // backend'den TAM/kesin gün sayısını çek — resmi tatil ve hafta sonlarını
+  // "Toplam Kullanılacak İzin" kutusuyla BİREBİR aynı şekilde hesaba katar.
+  useEffect(() => {
+    if (!hoverDateKey || !start || end || !personnelId) { setHoverDays(null); return; }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      api.post("/leaves/preview", { start_date: startDate, end_date: hoverDateKey, personnel_id: personnelId })
+        .then(({ data }) => { if (!cancelled) setHoverDays(data.days); })
+        .catch(() => { if (!cancelled) setHoverDays(null); });
+    }, 120);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [hoverDateKey, start, end, personnelId, startDate]);
+
+  const handleDayClick = (day) => {
+    const key = ymd(day);
+    if (!start || (start && end)) {
+      // Yeni seçim başlat
+      onChange({ start_date: key, end_date: "" });
+      setHoverPos(null); setHoverDateKey(null); setHoverDays(null);
+    } else if (day < start) {
+      // Başlangıçtan öncesine tıklandı → yeni başlangıç kabul et
+      onChange({ start_date: key, end_date: "" });
+    } else {
+      onChange({ start_date: startDate, end_date: key });
+      setHoverPos(null); setHoverDateKey(null); setHoverDays(null);
+    }
+  };
+
+  const handleDayMouseMove = (day, e) => {
+    if (start && !end && day >= start) {
+      setHoverPos({ x: e.clientX, y: e.clientY });
+      const key = ymd(day);
+      if (key !== hoverDateKey) setHoverDateKey(key);
+    } else {
+      setHoverPos(null); setHoverDateKey(null);
+    }
+  };
+
+  const renderMonthGrid = (monthDate) => {
+    const firstOfMonth = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
+    const startWeekday = (firstOfMonth.getDay() + 6) % 7; // Pazartesi=0 olacak şekilde kaydır
+    const daysInMonth = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0).getDate();
+    const cells = [];
+    for (let i = 0; i < startWeekday; i++) cells.push(null);
+    for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(monthDate.getFullYear(), monthDate.getMonth(), d));
+
+    // Başlangıç seçilip bitiş henüz seçilmemişken, imlecin üzerinde durduğu
+    // güne kadar olan aralığı CANLI önizleme olarak renklendirmek için:
+    const previewEnd = (start && !end && hoverDateKey) ? parseYmd(hoverDateKey) : null;
+
+    // Bu ayın resmi/dini tatilleri — takvim gridinin altında listelenecek
+    const yearMap = holidaysByYear[monthDate.getFullYear()] || {};
+    const monthHolidays = Object.entries(yearMap)
+      .filter(([date]) => Number(date.slice(5, 7)) - 1 === monthDate.getMonth())
+      .sort(([a], [b]) => a.localeCompare(b));
+
+    return (
+      <div className="flex-1 min-w-[220px]">
+        <div className="text-center text-sm font-semibold text-slate-800 mb-2">
+          {TR_MONTHS[monthDate.getMonth()]} {monthDate.getFullYear()}
+        </div>
+        <div className="grid grid-cols-7 gap-y-1 text-center">
+          {TR_WEEKDAYS.map((w, i) => (
+            <div key={w} className={`text-[10px] font-semibold uppercase ${i >= 5 ? "text-red-400" : "text-slate-400"}`}>{w}</div>
+          ))}
+          {cells.map((day, idx) => {
+            if (!day) return <div key={`empty-${monthDate.getMonth()}-${idx}`} />;
+            const key = ymd(day);
+            const isStart = start && key === ymd(start);
+            const isEnd = end && key === ymd(end);
+            const inRange = start && end && day > start && day < end;
+            // Canlı önizleme: başlangıçtan, imlecin üzerinde durduğu güne kadar
+            const isPreviewEnd = previewEnd && key === ymd(previewEnd) && !isStart;
+            const inPreviewRange = previewEnd && start && day > start && day < previewEnd;
+            const highlighted = inRange || inPreviewRange;
+            const holidayName = getHolidayName(key);
+            const isWeekend = day.getDay() === 0 || day.getDay() === 6; // Pazar=0, Cumartesi=6
+            const isSpecialDay = !isStart && !isEnd && !isPreviewEnd && !highlighted;
+            // Hafta sonu kırmızımsı, resmi/dini tatil daha belirgin (amber) renklenir;
+            // tatil, hafta sonuyla çakışsa bile tatil rengi öncelikli gösterilir.
+            const idleColor = holidayName
+              ? "bg-amber-100 text-amber-800 font-semibold"
+              : isWeekend
+              ? "bg-red-50 text-red-500"
+              : "text-slate-700";
+            return (
+              <button
+                type="button"
+                key={key}
+                onClick={() => handleDayClick(day)}
+                onMouseMove={(e) => handleDayMouseMove(day, e)}
+                onMouseLeave={() => { setHoverPos(null); setHoverDateKey(null); }}
+                title={holidayName || undefined}
+                className={[
+                  "h-8 w-8 mx-auto text-xs rounded-full transition-colors",
+                  isStart || isEnd ? "bg-blue-600 text-white font-semibold" : "",
+                  isPreviewEnd ? "bg-blue-500 text-white font-semibold ring-2 ring-blue-300 ring-offset-1" : "",
+                  highlighted && !isPreviewEnd ? "bg-blue-100 text-blue-800 rounded-none" : "",
+                  isSpecialDay ? `${idleColor} hover:bg-blue-200 hover:text-blue-900 hover:font-semibold` : "",
+                ].join(" ")}
+                data-testid={`cal-day-${key}`}
+              >
+                {day.getDate()}
+              </button>
+            );
+          })}
+        </div>
+        {monthHolidays.length > 0 && (
+          <div className="mt-2 pt-2 border-t border-slate-100 space-y-0.5" data-testid={`cal-holidays-${monthDate.getFullYear()}-${monthDate.getMonth()}`}>
+            {monthHolidays.map(([date, name]) => (
+              <div key={date} className="text-[10px] text-amber-800 leading-tight">
+                <span className="font-semibold">{Number(date.slice(8, 10))} {TR_MONTHS[monthDate.getMonth()]}</span>
+                {" "}— {name}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="rounded-lg border border-slate-200 p-3" data-testid="leave-range-calendar">
+      <div className="flex items-center justify-between mb-2">
+        <button type="button" onClick={() => setViewMonth((m) => new Date(m.getFullYear(), m.getMonth() - 1, 1))}
+          className="p-1 rounded hover:bg-slate-100 text-slate-500">
+          <ChevronLeft size={16} />
+        </button>
+        <div className="text-xs text-slate-400">İki aylık görünüm</div>
+        <button type="button" onClick={() => setViewMonth((m) => new Date(m.getFullYear(), m.getMonth() + 1, 1))}
+          className="p-1 rounded hover:bg-slate-100 text-slate-500">
+          <ChevronRight size={16} />
+        </button>
+      </div>
+      <div className="flex gap-4">
+        {renderMonthGrid(viewMonth)}
+        <div className="w-px bg-slate-200" />
+        {renderMonthGrid(nextViewMonth)}
+      </div>
+      {hoverPos && createPortal(
+        <div
+          className="fixed z-[1000] pointer-events-none bg-slate-900 text-white text-[11px] font-semibold px-2 py-1 rounded shadow-lg"
+          style={{ left: hoverPos.x + 12, top: hoverPos.y - 28 }}
+        >
+          {hoverDays === null ? "…" : fmtNum(hoverDays)} gün
+        </div>,
+        document.body
+      )}
+    </div>
+  );
+}
+// --------------------------------------------------------------------------
+
+
 function intAge(a) {
   if (a === null || a === undefined || a === "") return "—";
   const n = Number(a);
@@ -80,11 +306,18 @@ export default function PersonnelDetail() {
   const [deleteBusy, setDeleteBusy] = useState(false);
   const nav = useNavigate();
 
+  // İzin Kullanımları listesindeki tek tek kayıtları düzenlemek için —
+  // tarihleri VE gün sayısını (sistemin otomatik hesapladığından farklı
+  // olabilecek şekilde) elle değiştirmeye izin verir.
+  const [editLeave, setEditLeave] = useState(null); // düzenlenen kayıt, yoksa null
+  const [ef, setEf] = useState({ start_date: "", end_date: "", days: "", return_date: "", izin_turu: "", aciklama: "" });
+  const [editBusy, setEditBusy] = useState(false);
+
   const load = async () => {
     try {
       const { data: bal } = await api.get(`/personnel/${id}/balance`);
       setData(bal);
-      const { data: L } = await api.get("/leaves", { params: { personnel_id: id, include_consent: true } });
+      const { data: L } = await api.get("/leaves", { params: { personnel_id: id, include_consent: true, include_isbasi: true } });
       setLeaves(L);
     } catch (e) { toast.error(formatApiError(e)); }
   };
@@ -94,6 +327,43 @@ export default function PersonnelDetail() {
     if (!window.confirm("İzin kaydı silinsin mi?")) return;
     try { await api.delete(`/leaves/${lid}`); toast.success("İzin silindi"); await load(); }
     catch (e) { toast.error(formatApiError(e)); }
+  };
+
+  const openEditLeave = (L) => {
+    setEditLeave(L);
+    setEf({
+      start_date: (L.start_date || "").slice(0, 10),
+      end_date: (L.end_date || "").slice(0, 10),
+      days: String(L.days ?? ""),
+      // Sadece daha önce ELLE düzeltilmişse doldurulur — boşsa "otomatik
+      // hesaplanıyor" demektir, alttaki ipucu metninde gösterilir.
+      return_date: (L.isbasi_override || "").slice(0, 10),
+      izin_turu: L.izin_turu || "Yıllık İzin",
+      aciklama: L.aciklama || "",
+    });
+  };
+
+  const saveEditLeave = async () => {
+    if (!ef.start_date || !ef.end_date) return toast.error("Başlangıç ve bitiş tarihi zorunlu");
+    if (ef.days === "" || isNaN(Number(ef.days)) || Number(ef.days) < 0) {
+      return toast.error("Geçerli bir gün sayısı girin");
+    }
+    setEditBusy(true);
+    try {
+      await api.put(`/leaves/${editLeave.id}`, {
+        personnel_id: id,
+        start_date: ef.start_date,
+        end_date: ef.end_date,
+        izin_turu: ef.izin_turu,
+        aciklama: ef.aciklama,
+        days_override: Number(ef.days),
+        return_date_override: ef.return_date || null,
+      });
+      toast.success("İzin kaydı güncellendi — kalan izin, İzin Cetveli ve İzin Talep Formu bu kayıttan itibaren yeni değeri kullanacak.");
+      setEditLeave(null);
+      await load();
+    } catch (e) { toast.error(formatApiError(e)); }
+    finally { setEditBusy(false); }
   };
 
   const openDelete = async () => {
@@ -321,25 +591,20 @@ export default function PersonnelDetail() {
                     <CalendarPlus size={14} className="mr-1" /> İzin Ekle
                   </Button>
                 </DialogTrigger>
-                <DialogContent>
+                <DialogContent className="max-w-xl">
                   <DialogHeader>
                     <DialogTitle>Yeni Yıllık İzin</DialogTitle>
-                    <DialogDescription>Başlangıç ve bitiş tarihini seçin. Sistem hafta sonu ve tatilleri düşerek gün sayısını hesaplar.</DialogDescription>
                   </DialogHeader>
                   <div className="space-y-3">
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <Label>Başlangıç</Label>
-                        <Input type="date" value={lf.start_date}
-                          onChange={(e) => setLf((s) => ({ ...s, start_date: e.target.value }))}
-                          data-testid="leave-start" />
-                      </div>
-                      <div>
-                        <Label>Bitiş</Label>
-                        <Input type="date" value={lf.end_date}
-                          onChange={(e) => setLf((s) => ({ ...s, end_date: e.target.value }))}
-                          data-testid="leave-end" />
-                      </div>
+                    <LeaveRangeCalendar
+                      startDate={lf.start_date}
+                      endDate={lf.end_date}
+                      personnelId={id}
+                      onChange={({ start_date, end_date }) => setLf((s) => ({ ...s, start_date, end_date }))}
+                    />
+                    <div className="grid grid-cols-2 gap-3 text-xs text-slate-500">
+                      <div>Başlangıç: <span className="font-semibold text-slate-700">{lf.start_date ? toTr(lf.start_date) : "—"}</span></div>
+                      <div>Bitiş: <span className="font-semibold text-slate-700">{lf.end_date ? toTr(lf.end_date) : "—"}</span></div>
                     </div>
                     {preview && (
                       <div className="rounded-lg border-2 border-blue-200 bg-blue-50/70 p-3 grid grid-cols-2 gap-3" data-testid="leave-preview-summary">
@@ -356,6 +621,18 @@ export default function PersonnelDetail() {
                             {preview.return_weekday && (
                               <span className="ml-2 text-base font-semibold text-emerald-600">{preview.return_weekday}</span>
                             )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    {preview && preview.consent_required && (
+                      <div className="rounded-lg border-2 border-amber-300 bg-amber-50 p-3 flex items-start gap-2" data-testid="leave-preview-consent-warning">
+                        <AlertTriangle size={18} className="text-amber-700 shrink-0 mt-0.5" />
+                        <div className="text-sm text-amber-800">
+                          <div className="font-semibold">Muvafakatname gerekecek — {fmtNum(preview.consent_advance_days)} gün</div>
+                          <div className="text-xs text-amber-700 mt-0.5">
+                            Bu izin, hak edilen bakiyeyi ({fmtNum(preview.current_remaining)} gün) aşıyor.
+                            Kaydettikten sonra ücret kesintisi taahhüdü için muvafakatname doldurulması gerekecek.
                           </div>
                         </div>
                       </div>
@@ -542,7 +819,7 @@ export default function PersonnelDetail() {
               data-testid={`consent-preview-${latestAdvanceLeave.id}`}
               title={`Muvafakatname yazdır: ${toTr(latestAdvanceLeave.start_date)} → ${toTr(latestAdvanceLeave.end_date)}`}
             >
-              <Link to={`/izin/${latestAdvanceLeave.id}/muvafakatname`} target="_blank" className="inline-flex items-center gap-1.5">
+              <Link to={`/izin/${latestAdvanceLeave.id}/muvafakatname`} className="inline-flex items-center gap-1.5">
                 <Printer size={14} />
                 Muvafakatname Yazdır
               </Link>
@@ -680,22 +957,32 @@ export default function PersonnelDetail() {
             <h4 className="text-sm font-semibold text-slate-800 mb-2">İzin Kullanımları</h4>
             <div className="overflow-x-auto">
               <table className="table-clean w-full">
-                <thead><tr><th>Başlangıç</th><th>Bitiş</th><th>Gün</th><th>Tür</th><th>Açıklama</th><th></th></tr></thead>
+                <thead><tr><th>Başlangıç</th><th>Bitiş</th><th>Gün</th><th>Dönüş</th><th>Tür</th><th>Açıklama</th><th></th></tr></thead>
                 <tbody>
                   {leaves.map((L) => (
                     <tr key={L.id} data-testid={`leave-row-${L.id}`}>
                       <td className="font-mono text-xs">{toTr(L.start_date)}</td>
                       <td className="font-mono text-xs">{toTr(L.end_date)}</td>
                       <td className="tabular-nums font-medium">{L.days}</td>
+                      <td className="font-mono text-xs">
+                        {toTr(L.isbasi_tarihi)}
+                        {L.isbasi_override && <span title="Elle düzeltilmiş" className="ml-1 text-amber-600">✎</span>}
+                      </td>
                       <td>{L.izin_turu}</td>
                       <td className="max-w-[220px] truncate">{L.aciklama || "—"}</td>
                       <td className="text-right whitespace-nowrap">
                         <Button asChild variant="ghost" size="sm" data-testid={`print-leave-${L.id}`} title="İzin Talep Formu — önizleme">
-                          <Link to={`/izin/${L.id}/yazdir`} target="_blank"><Printer size={14} /></Link>
+                          <Link to={`/izin/${L.id}/yazdir`}><Printer size={14} /></Link>
                         </Button>
                         <Button asChild variant="ghost" size="sm" title="Muvafakatname">
-                          <Link to={`/izin/${L.id}/muvafakatname`} target="_blank" className="text-amber-700"><FileSignature size={14} /></Link>
+                          <Link to={`/izin/${L.id}/muvafakatname`} className="text-amber-700"><FileSignature size={14} /></Link>
                         </Button>
+                        {canEdit && (
+                          <Button variant="ghost" size="sm" onClick={() => openEditLeave(L)} className="text-blue-700"
+                                  title="İzin kaydını düzenle (tarih / gün sayısı)" data-testid={`edit-leave-${L.id}`}>
+                            <Pencil size={14} />
+                          </Button>
+                        )}
                         {canEdit && (
                           <Button variant="ghost" size="sm" onClick={() => delLeave(L.id)} className="text-red-600" data-testid={`del-leave-${L.id}`}>
                             <Trash2 size={14} />
@@ -705,7 +992,7 @@ export default function PersonnelDetail() {
                     </tr>
                   ))}
                   {leaves.length === 0 && (
-                    <tr><td colSpan={6} className="text-center py-6 text-slate-400">İzin kaydı yok.</td></tr>
+                    <tr><td colSpan={7} className="text-center py-6 text-slate-400">İzin kaydı yok.</td></tr>
                   )}
                 </tbody>
               </table>
@@ -713,6 +1000,75 @@ export default function PersonnelDetail() {
           </div>
         </Card>
       </div>
+
+      {/* İzin kaydı düzenleme — tarih VE gün sayısını sistemin otomatik
+          hesabından bağımsız olarak elle değiştirmeye izin verir. Kaydedilince
+          kalan izin, İzin Cetveli ve İzin Talep Formu bu yeni değeri kullanır. */}
+      <Dialog open={!!editLeave} onOpenChange={(v) => { if (!v) setEditLeave(null); }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>İzin Kaydını Düzenle</DialogTitle>
+            <DialogDescription>
+              Normal izin girişinde gün sayısı tarihten otomatik hesaplanır. Burada
+              tarihleri ve/veya gün sayısını elle değiştirebilirsiniz — örn. sistemin
+              hesapladığından farklı bir gün sayısı girmek istediğinizde. Kaydedince
+              kalan izin, İzin Cetveli ve İzin Talep Formu bu düzeltilmiş değeri kullanır.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label>Başlangıç Tarihi</Label>
+                <Input type="date" value={ef.start_date}
+                       onChange={(e) => setEf((s) => ({ ...s, start_date: e.target.value }))}
+                       data-testid="edit-leave-start" />
+              </div>
+              <div>
+                <Label>Bitiş Tarihi</Label>
+                <Input type="date" value={ef.end_date}
+                       onChange={(e) => setEf((s) => ({ ...s, end_date: e.target.value }))}
+                       data-testid="edit-leave-end" />
+              </div>
+            </div>
+            <div>
+              <Label>Gün Sayısı</Label>
+              <Input type="number" step="0.5" min="0" value={ef.days}
+                     onChange={(e) => setEf((s) => ({ ...s, days: e.target.value }))}
+                     data-testid="edit-leave-days" />
+              <p className="text-xs text-slate-500 mt-1">
+                Sistemin tarihten hesapladığı değerden farklı bir sayı girerseniz, kaydedilen
+                gün sayısı burada yazdığınız <b>elle girilen</b> değer olur.
+              </p>
+            </div>
+            <div>
+              <Label>İzin Dönüş (İşbaşı) Tarihi</Label>
+              <Input type="date" value={ef.return_date}
+                     onChange={(e) => setEf((s) => ({ ...s, return_date: e.target.value }))}
+                     data-testid="edit-leave-return" />
+              <p className="text-xs text-slate-500 mt-1">
+                Boş bırakırsanız otomatik hesaplanır{editLeave?.isbasi_tarihi ? ` (şu an: ${toTr(editLeave.isbasi_tarihi)})` : ""}.
+                Bir tarih girerseniz, İzin Cetveli ve İzin Talep Formu'nda dönüş tarihi olarak
+                burada yazdığınız <b>elle girilen</b> tarih kullanılır.
+              </p>
+            </div>
+            <div>
+              <Label>İzin Türü</Label>
+              <Input value={ef.izin_turu} onChange={(e) => setEf((s) => ({ ...s, izin_turu: e.target.value }))} />
+            </div>
+            <div>
+              <Label>Açıklama</Label>
+              <Textarea rows={2} value={ef.aciklama} onChange={(e) => setEf((s) => ({ ...s, aciklama: e.target.value }))} />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setEditLeave(null)}>Vazgeç</Button>
+            <Button onClick={saveEditLeave} disabled={editBusy} className="bg-blue-600 hover:bg-blue-700" data-testid="edit-leave-save">
+              Kaydet
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
+
   );
 }

@@ -460,6 +460,7 @@ function downloadReportExcel(data) {
       [
         "Sicil",
         "Ad Soyad",
+        "Departman",
         "İşe Giriş",
         "Hak Edilen",
         "Kullanılan",
@@ -468,6 +469,7 @@ function downloadReportExcel(data) {
       ...rows.map((r) => [
         String(r.personnel.sicil_no ?? ""),
         String(r.personnel.ad_soyad ?? ""),
+        String(r.personnel.departman ?? ""),
         toTr(r.personnel.ise_giris),
         numberValue(r.balance.entitled_total),
         numberValue(r.balance.used_total),
@@ -478,13 +480,14 @@ function downloadReportExcel(data) {
     const worksheet = XLSX.utils.aoa_to_sheet(excelData);
 
     worksheet["!merges"] = [
-      XLSX.utils.decode_range("A1:F1"),
-      XLSX.utils.decode_range("A2:F2"),
+      XLSX.utils.decode_range("A1:G1"),
+      XLSX.utils.decode_range("A2:G2"),
     ];
 
     worksheet["!cols"] = [
       { wch: 12 },
       { wch: 32 },
+      { wch: 26 },
       { wch: 14 },
       { wch: 14 },
       { wch: 14 },
@@ -493,11 +496,11 @@ function downloadReportExcel(data) {
 
     if (rows.length > 0) {
       worksheet["!autofilter"] = {
-        ref: `A4:F${rows.length + 4}`,
+        ref: `A4:G${rows.length + 4}`,
       };
     }
 
-    const numericColumns = ["D", "E", "F"];
+    const numericColumns = ["E", "F", "G"];
 
     numericColumns.forEach((col) => {
       for (let row = 5; row <= rows.length + 4; row += 1) {
@@ -644,6 +647,10 @@ function PreviewDepartman({ data, onBack }) {
                 Ad Soyad
               </th>
 
+              <th className="border border-slate-800 px-2 py-1.5 text-left">
+                Departman
+              </th>
+
               <th className="border border-slate-800 px-2 py-1.5">
                 İşe Giriş
               </th>
@@ -681,6 +688,10 @@ function PreviewDepartman({ data, onBack }) {
                   </Link>
                 </td>
 
+                <td className="border border-slate-400 px-2 py-1">
+                  {r.personnel.departman || "—"}
+                </td>
+
                 <td className="border border-slate-400 px-2 py-1 text-center font-mono">
                   {toTr(r.personnel.ise_giris)}
                 </td>
@@ -710,7 +721,7 @@ function PreviewDepartman({ data, onBack }) {
             {rows.length === 0 && (
               <tr>
                 <td
-                  colSpan={6}
+                  colSpan={7}
                   className="border border-slate-400 px-2 py-4 text-center text-slate-500"
                 >
                   Personel bulunamadı.

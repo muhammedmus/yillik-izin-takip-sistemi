@@ -76,6 +76,9 @@ export default function LeavePrint() {
   };
 
   const printPreview = () => {
+    // Iter 66: Muvafakatname artık backend'de PDF'in içine gömülüyor
+    // (bkz. /leaves/{id}/talep-formu.pdf) — tek, gerçek bir PDF olduğu için
+    // önizleme iframe'ini yazdırmak her zaman ikisini birden verir.
     if (iframeRef.current && iframeRef.current.contentWindow) {
       try {
         iframeRef.current.contentWindow.focus();
@@ -90,7 +93,11 @@ export default function LeavePrint() {
   const L = meta?.leave;
   const subtitle = p && L
     ? `${p.ad_soyad} · ${p.sicil_no} — ${toTr(L.start_date)} → ${toTr(L.end_date)} · ${L.days} gün`
+      + (meta?.consent_required ? " · + Muvafakatname" : "")
     : loading ? "Yükleniyor..." : "İzin Talep Formu";
+  const title = meta?.consent_required
+    ? "Yıllık Ücretli İzin Talep ve Onay Formu + Muvafakatname"
+    : "Yıllık Ücretli İzin Talep ve Onay Formu";
 
   // A4 Portrait aspect (210 x 297 mm) — height fills viewport below toolbar,
   // width derived from aspect-ratio, clamped by container.
@@ -104,7 +111,7 @@ export default function LeavePrint() {
 
   return (
     <DocumentPreviewShell
-      title="Yıllık Ücretli İzin Talep ve Onay Formu"
+      title={title}
       subtitle={subtitle}
       onClose={() => (p?.id ? nav(`/personel/${p.id}`) : nav(-1))}
       onPrint={printPreview}
@@ -122,14 +129,16 @@ export default function LeavePrint() {
         </div>
       )}
       {!loading && !error && pdfUrl && (
-        <iframe
-          ref={iframeRef}
-          src={pdfUrl}
-          title="İzin Talep Formu Ön İzleme"
-          className="document-preview shadow-md"
-          style={iframeStyle}
-          data-testid="izin-form-iframe"
-        />
+        <div className="document-preview w-full flex flex-col items-center gap-8 print:gap-0" data-testid="combined-preview">
+          <iframe
+            ref={iframeRef}
+            src={pdfUrl}
+            title="İzin Talep Formu Ön İzleme"
+            className="shadow-md print:shadow-none"
+            style={iframeStyle}
+            data-testid="izin-form-iframe"
+          />
+        </div>
       )}
     </DocumentPreviewShell>
   );
