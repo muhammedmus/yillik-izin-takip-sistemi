@@ -268,6 +268,23 @@ async def main():
     if not new_rows and not removed_count and not updated_count:
         print("OK: Guncel Yillik Izin -> degisiklik yok, dosya zaten guncel.")
 
+    # "Personel" sayfasi: Sicil No | Ad Soyad | Departman | Gorev
+    # (Personel Canli Takip > Devam Takvimi giris-cikis raporu icin; her calismada yeniden yazilir.)
+    if "Personel" in wb.sheetnames:
+        del wb["Personel"]
+    pws = wb.create_sheet("Personel")
+    pws.append(["Sicil No", "Ad Soyad", "Departman", "Gorev"])
+    for i, w in enumerate((12, 30, 30, 30), start=1):
+        pws.cell(row=1, column=i).font = Font(bold=True)
+        pws.column_dimensions[pws.cell(row=1, column=i).column_letter].width = w
+    pcount = 0
+    async for p in db.personnel.find({}, {"_id": 0, "sicil_no": 1, "ad_soyad": 1, "departman": 1, "gorev": 1}):
+        pws.append([str(p.get("sicil_no") or ""), p.get("ad_soyad") or "",
+                    p.get("departman") or "", p.get("gorev") or ""])
+        pcount += 1
+    wb.active = wb.sheetnames.index(ws.title)
+    print(f"OK: Personel sayfasi -> {pcount} personel (departman/gorev) yazildi.")
+
     os.makedirs(os.path.dirname(MASTER_PATH), exist_ok=True)
     wb.save(MASTER_PATH)
 
