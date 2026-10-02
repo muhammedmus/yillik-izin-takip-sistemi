@@ -116,6 +116,7 @@ export default function LeavePrint() {
       onClose={() => (p?.id ? nav(`/personel/${p.id}`) : nav(-1))}
       onPrint={printPreview}
       onPdf={() => doDownload("pdf")}
+      centerActions
     >
       {loading && (
         <div className="bg-white rounded shadow-sm p-12 text-center text-slate-500" data-testid="izin-form-loading">

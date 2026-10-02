@@ -2920,11 +2920,79 @@ async def _invalidate_cetvel_for(personnel_ids) -> None:
         return
     try:
         # Sadece daha önce cetveli oluşturulmuş personel için needs_refill bayrağını set et.
-        await db.personnel.update_many(
-            {"id": {"$in": ids}, "cetvel_generated_at": {"$exists": True}},
-            {"$set": {"cetvel_needs_refill": True},
-             "$unset": {"cetvel_generated_at": ""}},
-        )
+        # Önceki onay zamanı 'cetvel_prev_generated_at' içinde saklanır; uyarıya yol açan
+        # izin sonradan silinirse cetvel eski haline döndürülebilsin (_revalidate_cetvel_for).
+        async for _p in db.personnel.find(
+                {"id": {"$in": ids}, "cetvel_generated_at": {"$exists": True}},
+                {"_id": 0, "id": 1, "cetvel_generated_at": 1}):
+            await db.personnel.update_one(
+                {"id": _p["id"]},
+                {"$set": {"cetvel_needs_refill": True,
+                          "cetvel_prev_generated_at": _p.get("cetvel_generated_at")},
+                 "$unset": {"cetvel_generated_at": ""}},
+            )
+    except Exception:
+        pass
+
+
+async def _revalidate_cetvel_for(personnel_ids) -> None:
+    """'İzin Cetveli Yeniden Doldurulmalıdır' uyarısını, uyarıya sebep olan izin(ler)
+    silindiğinde geri alır.
+
+    Kural: personelin son cetvel onayından SONRA oluşturulmuş hiçbir aktif izin kaydı
+    kalmadıysa cetvel yeniden geçerli sayılır (cetvel_generated_at geri yazılır,
+    cetvel_needs_refill silinir). Son onay zamanı 'cetvel_prev_generated_at'
+    alanından, o yoksa (eski kayıtlar) denetim kaydındaki son 'cetvel_mark'tan alınır.
+    """
+    if not personnel_ids:
+        return
+    if isinstance(personnel_ids, str):
+        personnel_ids = [personnel_ids]
+    ids = [pid for pid in {p for p in personnel_ids if p}]
+    if not ids:
+        return
+    try:
+        async for p in db.personnel.find(
+                {"id": {"$in": ids}, "cetvel_needs_refill": True},
+                {"_id": 0, "id": 1, "cetvel_prev_generated_at": 1}):
+            prev = p.get("cetvel_prev_generated_at")
+            if not prev:
+                last = await db.audit_log.find_one(
+                    {"action": "cetvel_mark", "entity_id": p["id"]},
+                    {"_id": 0}, sort=[("created_at", -1)])
+                if last:
+                    prev = ((last.get("new_values") or {}).get("cetvel_generated_at")
+                            or last.get("created_at"))
+            if not prev:
+                continue
+            try:
+                prev_dt = datetime.fromisoformat(str(prev))
+                if prev_dt.tzinfo is None:
+                    prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            newer = False
+            async for L in db.leaves.find({"personnel_id": p["id"]}, {"_id": 0, "created_at": 1}):
+                c = L.get("created_at")
+                if not c:
+                    continue
+                try:
+                    c_dt = datetime.fromisoformat(str(c))
+                    if c_dt.tzinfo is None:
+                        c_dt = c_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    newer = True  # okunamayan tarih: güvenli tarafta kal, uyarı sürsün
+                    break
+                if c_dt > prev_dt:
+                    newer = True
+                    break
+            if newer:
+                continue
+            await db.personnel.update_one(
+                {"id": p["id"]},
+                {"$set": {"cetvel_generated_at": str(prev)},
+                 "$unset": {"cetvel_needs_refill": "", "cetvel_prev_generated_at": ""}},
+            )
     except Exception:
         pass
 
@@ -2941,7 +3009,8 @@ async def personnel_cetvel_mark(pid: str, request: Request,
     await db.personnel.update_one({"id": pid},
                                     {"$set": {"cetvel_generated_at": ts,
                                               "cetvel_generated_by": user.get("id")},
-                                     "$unset": {"cetvel_needs_refill": ""}})
+                                     "$unset": {"cetvel_needs_refill": "",
+                                                "cetvel_prev_generated_at": ""}})
     await _audit(action="cetvel_mark", module="personnel", entity_type="personnel",
                  entity_id=pid, entity_name=p.get("ad_soyad"),
                  new_values={"cetvel_generated_at": ts},
@@ -2962,7 +3031,8 @@ async def personnel_cetvel_unmark(pid: str, request: Request,
     await db.personnel.update_one({"id": pid},
                                     {"$unset": {"cetvel_generated_at": "",
                                                 "cetvel_generated_by": "",
-                                                "cetvel_needs_refill": ""}})
+                                                "cetvel_needs_refill": "",
+                                                "cetvel_prev_generated_at": ""}})
     await _audit(action="cetvel_unmark", module="personnel", entity_type="personnel",
                  entity_id=pid, entity_name=p.get("ad_soyad"),
                  old_values={"cetvel_generated_at": prev},
@@ -3607,6 +3677,10 @@ async def personnel_balance(pid: str, _: dict = Depends(get_current_user)):
     p = await db.personnel.find_one({"id": pid}, {"_id": 0})
     if not p:
         raise HTTPException(status_code=404, detail="Personel bulunamadı")
+    if p.get("cetvel_needs_refill"):
+        # Uyarıya sebep olan izin silinmişse (bu düzeltmeden önce takılı kalanlar dahil) uyarıyı kaldır.
+        await _revalidate_cetvel_for(pid)
+        p = await db.personnel.find_one({"id": pid}, {"_id": 0}) or p
     detail = await _compute_entitlements(p)
     return {"personnel": p, "balance": detail}
 
@@ -5048,6 +5122,7 @@ async def delete_leave(lid: str, request: Request, reason: str = "",
     bal_before = await _balance_for(p) if p else {"remaining": 0}
     await db.leaves.delete_one({"id": lid})
     await db.leave_allocation.delete_many({"lid": lid})
+    await _revalidate_cetvel_for(L["personnel_id"])  # cetvel uyarısını gerekiyorsa geri al
     bal_after = await _balance_for(p) if p else {"remaining": 0}
     await _audit(action="delete", module="leaves", entity_type="leave",
                  entity_id=lid, entity_name=(p.get("ad_soyad") if p else L["personnel_id"]),
@@ -5110,6 +5185,7 @@ async def bulk_delete_leaves(body: BulkDeleteLeavesIn, request: Request,
     # Silme uygula
     delres = await db.leaves.delete_many({"id": {"$in": ids}})
     await db.leave_allocation.delete_many({"lid": {"$in": ids}})
+    await _revalidate_cetvel_for(list(per_person.keys()))  # cetvel uyarısını gerekiyorsa geri al
 
     total_days = round(sum(float(L.get("days", 0)) for L in docs), 2)
     annual = sum(1 for L in docs if (L.get("izin_turu") or "").lower().startswith(("yıl", "yil")))
@@ -7557,6 +7633,20 @@ async def _fill_talep_formu(personnel: dict, leave: dict, hak_edis_tarihi: Optio
     from datetime import datetime as _dt
     wb = load_workbook(TEMPLATE_PATH, keep_vba=True)
     ws = wb["İZİN TALEP FORMU"]
+
+    # Form yerleşimi: "İşe Giriş Tarihi" (10) ve "Sicil Numarası" (11) satırları
+    # "İzin Başlangıç Tarihi" (13) satırıyla aynı yüksekliğe getirilir; ardından
+    # tüm satırlar aynı oranda uzatılarak form A4'te aşağı doğru yayılır
+    # (sayfanın altında yaklaşık 5 cm boşluk kalacak şekilde).
+    # Logo yerleştirilmeden ÖNCE yapılmalı (logo kutusu satır yüksekliğinden hesaplanır).
+    _FORM_ROW_SCALE = 1.067
+    _def_h = ws.sheet_format.defaultRowHeight or 15
+    _ref_h = ws.row_dimensions[13].height or 45
+    ws.row_dimensions[10].height = _ref_h
+    ws.row_dimensions[11].height = _ref_h
+    for _r in range(1, 31):
+        _h = ws.row_dimensions[_r].height or _def_h
+        ws.row_dimensions[_r].height = round(_h * _FORM_ROW_SCALE, 2)
 
     def _d(iso: Optional[str]):
         if not iso: return None

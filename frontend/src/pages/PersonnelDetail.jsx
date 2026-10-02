@@ -172,6 +172,8 @@ function LeaveRangeCalendar({ startDate, endDate, personnelId, onChange }) {
             const highlighted = inRange || inPreviewRange;
             const holidayName = getHolidayName(key);
             const isWeekend = day.getDay() === 0 || day.getDay() === 6; // Pazar=0, Cumartesi=6
+            // Bugün: takvim açıldığında hemen fark edilsin diye yeşil renkle vurgulanır.
+            const isToday = key === ymd(new Date());
             const isSpecialDay = !isStart && !isEnd && !isPreviewEnd && !highlighted;
             // Hafta sonu kırmızımsı, resmi/dini tatil daha belirgin (amber) renklenir;
             // tatil, hafta sonuyla çakışsa bile tatil rengi öncelikli gösterilir.
@@ -187,13 +189,15 @@ function LeaveRangeCalendar({ startDate, endDate, personnelId, onChange }) {
                 onClick={() => handleDayClick(day)}
                 onMouseMove={(e) => handleDayMouseMove(day, e)}
                 onMouseLeave={() => { setHoverPos(null); setHoverDateKey(null); }}
-                title={holidayName || undefined}
+                title={[isToday ? "Bugün" : "", holidayName || ""].filter(Boolean).join(" — ") || undefined}
                 className={[
                   "h-8 w-8 mx-auto text-xs rounded-full transition-colors",
                   isStart || isEnd ? "bg-blue-600 text-white font-semibold" : "",
                   isPreviewEnd ? "bg-blue-500 text-white font-semibold ring-2 ring-blue-300 ring-offset-1" : "",
                   highlighted && !isPreviewEnd ? "bg-blue-100 text-blue-800 rounded-none" : "",
-                  isSpecialDay ? `${idleColor} hover:bg-blue-200 hover:text-blue-900 hover:font-semibold` : "",
+                  isSpecialDay && !isToday ? `${idleColor} hover:bg-blue-200 hover:text-blue-900 hover:font-semibold` : "",
+                  isSpecialDay && isToday ? "bg-emerald-500 text-white font-bold hover:bg-emerald-600" : "",
+                  isToday && !isPreviewEnd ? "ring-2 ring-emerald-500 ring-offset-1" : "",
                 ].join(" ")}
                 data-testid={`cal-day-${key}`}
               >
@@ -282,8 +286,8 @@ function KV({ k, v, tr }) {
 function StatCell({ label, value, highlight }) {
   return (
     <div className="p-4">
-      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">{label}</div>
-      <div className={`mt-1 text-lg font-semibold ${highlight ? "text-blue-700" : "text-slate-900"}`}>{value}</div>
+      <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold">{label}</div>
+      <div className={`mt-1 text-xl font-semibold ${highlight ? "text-blue-700" : "text-slate-900"}`}>{value}</div>
     </div>
   );
 }
@@ -400,7 +404,8 @@ export default function PersonnelDetail() {
   };
   useEffect(() => { doPreview(); /* eslint-disable-next-line */ }, [lf.start_date, lf.end_date]);
 
-  const saveLeave = async () => {
+  // andPrint === true ise kayıttan sonra doğrudan izin talep formu ön izleme/yazdırma sayfası açılır.
+  const saveLeave = async (andPrint = false) => {
     try {
       const { data } = await api.post("/leaves", { ...lf, personnel_id: id });
       if (data.notified?.length) toast.success(`İzin kaydedildi. ${data.notified.length} kişiye e-posta gönderildi.`);
@@ -408,6 +413,7 @@ export default function PersonnelDetail() {
       setOpenLeave(false);
       setLf({ start_date: "", end_date: "", izin_turu: "Yıllık İzin", aciklama: "" });
       setPreview(null);
+      if (andPrint === true && data?.id) { nav(`/izin/${data.id}/yazdir`); return; }
       await load();
     } catch (e) { toast.error(formatApiError(e)); }
   };
@@ -660,8 +666,13 @@ export default function PersonnelDetail() {
                       </div>
                     )}
                   </div>
-                  <DialogFooter>
-                    <Button onClick={saveLeave} disabled={!preview || preview.days <= 0}
+                  <DialogFooter className="sm:justify-between">
+                    <Button onClick={() => saveLeave(true)} disabled={!preview || preview.days <= 0}
+                            variant="outline" className="border-blue-300 text-blue-700 hover:bg-blue-50"
+                            data-testid="save-print-leave-btn">
+                      <Printer size={14} className="mr-1" /> Kaydet ve Yazdır
+                    </Button>
+                    <Button onClick={() => saveLeave(false)} disabled={!preview || preview.days <= 0}
                             className="bg-blue-600 hover:bg-blue-700" data-testid="save-leave-btn">
                       Kaydet
                     </Button>
@@ -860,8 +871,7 @@ export default function PersonnelDetail() {
 
       <Card className="border border-slate-200 shadow-sm">
         <div className="p-5 border-b border-slate-200 flex justify-between items-center">
-          <h3 className="text-base font-semibold">Kıdem ve Hak Ediş Özeti</h3>
-          <div className="text-xs text-slate-500">4857 sayılı İş Kanunu</div>
+          <h3 className="text-lg font-semibold">Kıdem ve Hak Ediş Özeti</h3>
         </div>
         <div className="grid grid-cols-2 md:grid-cols-5 divide-x divide-slate-100">
           <StatCell label="Son İşe Giriş" value={toTr(bal.hire_date || p.ise_giris)} />
@@ -928,10 +938,9 @@ export default function PersonnelDetail() {
         <Card className="lg:col-span-2 border border-slate-200 shadow-sm">
           <div className="p-5 border-b border-slate-200">
             <h3 className="text-base font-semibold">Hak Ediş Kayıtları</h3>
-            <p className="text-xs text-slate-500">Her hak ediş immutable — sonradan bozulmaz.</p>
           </div>
-          <div className="overflow-x-auto">
-            <table className="table-clean w-full">
+          <div className="overflow-x-auto overflow-y-auto" style={{ maxHeight: 222 }} data-testid="entitlements-scroll">
+            <table className="table-clean table-sticky-head w-full">
               <thead>
                 <tr><th>Tarih</th><th>Önc. Kıdem</th><th>Yeni Dönem</th><th>Toplam</th><th>Yaş</th><th className="text-right">Gün</th></tr>
               </thead>
@@ -955,8 +964,8 @@ export default function PersonnelDetail() {
 
           <div className="p-5 border-t border-slate-200">
             <h4 className="text-sm font-semibold text-slate-800 mb-2">İzin Kullanımları</h4>
-            <div className="overflow-x-auto">
-              <table className="table-clean w-full">
+            <div className="overflow-x-auto overflow-y-auto" style={{ maxHeight: 280 }} data-testid="leaves-scroll">
+              <table className="table-clean table-sticky-head w-full">
                 <thead><tr><th>Başlangıç</th><th>Bitiş</th><th>Gün</th><th>Dönüş</th><th>Tür</th><th>Açıklama</th><th></th></tr></thead>
                 <tbody>
                   {leaves.map((L) => (
