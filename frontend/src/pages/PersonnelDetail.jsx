@@ -404,7 +404,8 @@ export default function PersonnelDetail() {
   };
   useEffect(() => { doPreview(); /* eslint-disable-next-line */ }, [lf.start_date, lf.end_date]);
 
-  // andPrint === true ise kayıttan sonra doğrudan izin talep formu ön izleme/yazdırma sayfası açılır.
+  // andPrint === true ise kayıttan sonra izin talep formu ön izleme sayfası açılır ve
+  // PDF yüklenince yazdırma penceresi kendiliğinden gelir (LeavePrint: autoPrint).
   const saveLeave = async (andPrint = false) => {
     try {
       const { data } = await api.post("/leaves", { ...lf, personnel_id: id });
@@ -413,7 +414,7 @@ export default function PersonnelDetail() {
       setOpenLeave(false);
       setLf({ start_date: "", end_date: "", izin_turu: "Yıllık İzin", aciklama: "" });
       setPreview(null);
-      if (andPrint === true && data?.id) { nav(`/izin/${data.id}/yazdir`); return; }
+      if (andPrint === true && data?.id) { nav(`/izin/${data.id}/yazdir`, { state: { autoPrint: true } }); return; }
       await load();
     } catch (e) { toast.error(formatApiError(e)); }
   };

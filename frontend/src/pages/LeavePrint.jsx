@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { api, API_BASE } from "@/lib/api";
 import { DocumentPreviewShell } from "@/components/DocumentPreviewShell";
@@ -28,6 +28,14 @@ export default function LeavePrint() {
   const [error, setError] = useState("");
   const iframeRef = useRef(null);
   const token = localStorage.getItem("token");
+  // "Kaydet ve Yazdır" ile gelindiyse PDF yüklenince yazdırma penceresi bir kez
+  // kendiliğinden açılır. İşaret hemen geçmişten silinir; sayfa yenilenirse tekrar açılmaz.
+  const location = useLocation();
+  const autoPrintRef = useRef(location.state?.autoPrint === true);
+  useEffect(() => {
+    if (location.state?.autoPrint) nav(location.pathname, { replace: true, state: null });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     api.get(`/leaves/${id}/print`)
@@ -89,6 +97,13 @@ export default function LeavePrint() {
     window.print();
   };
 
+  const handleIframeLoad = () => {
+    if (!autoPrintRef.current) return;
+    autoPrintRef.current = false;
+    // PDF görüntüleyicinin hazır olması için kısa bir bekleme
+    setTimeout(printPreview, 700);
+  };
+
   const p = meta?.personnel;
   const L = meta?.leave;
   const subtitle = p && L
@@ -137,6 +152,7 @@ export default function LeavePrint() {
             title="İzin Talep Formu Ön İzleme"
             className="shadow-md print:shadow-none"
             style={iframeStyle}
+            onLoad={handleIframeLoad}
             data-testid="izin-form-iframe"
           />
         </div>
